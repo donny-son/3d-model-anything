@@ -9,6 +9,10 @@ rebuild pipeline (`scan-to-threejs` skill) can use directly. Per room it records
   coverage, plus a shutter for close-ups. Exact camera pose + intrinsics per photo.
 - **Depth frames**: 256×192 Float16 depth + confidence + a 640×480 color JPEG, up to 5/s.
 
+It also scans **small objects for 3D printing** (see [Small objects](#small-objects-3d-printing)):
+LiDAR depth, the pose of every frame, 100 Hz motion data and ARKit feature points around one object,
+which the `scan-to-stl` skill fuses into a watertight, millimetre-scaled STL.
+
 Requires an iPhone or iPad **with LiDAR** running iOS 17+.
 
 ## Build
@@ -40,6 +44,42 @@ Everything is also in the Files app under 3D Model Anything.
 LiDAR vertices. It chooses sharp, unobstructed views and reuses photos from aligned earlier
 sessions. Texture decoding shares a 48-megapixel budget across the house; areas without a
 usable full-triangle photo keep their cached vertex colors.
+
+## Small objects (3D printing)
+
+Home → **Scan something to 3D print** → **Scan an object**. Point at the table until it is found,
+then tap the object: a box is sized from the LiDAR depth around the tap, extended back to cover the
+side the phone can't see yet, and drawn over it (sliders adjust footprint and height; the STL step
+grows it further from the whole scan). The table must be found first: an ARKit plane under the
+tap, the capture mat, or the table height in the depth. **Start scanning** and walk slowly around it at 25–40 cm: low, level
+and from above. Dots around the box (12 directions × 3 heights) turn green as each view is covered.
+**Finish** saves the scan; share it as a ZIP and run
+`.agents/skills/scan-to-stl/scripts/object_to_stl.py <folder>` on a computer to get the STL. The
+screen stays awake while scanning; locking the phone or switching apps pauses it, and ARKit
+relocalizes into the same world when you come back.
+
+While scanning, a depth frame is kept (up to 10/s) only when tracking is normal, the object is in the
+middle of the view, 12–80 cm away, the gyro reads under 1.2 rad/s and the camera moved 1 cm or turned
+2.3°. A 1920×1440 photo is taken for each view direction while the phone is steady. The IMU runs at
+100 Hz on the same clock as the frames; ARKit feature points inside the box are logged as an
+independent position check.
+
+**Capture mat**: `make_capture_mat.py` (scan-to-stl skill) prints a 180 mm pattern with a 100 mm check
+ruler. The app tracks it as an ARKit reference image (`CaptureMat.png`, the same pattern): it gives
+plain tables texture, sets the base plane and box orientation, and records ARKit's estimate of its
+size as a scale check. Regenerate both from the script if you change the pattern; the app's
+`matPhysicalWidth` must match.
+
+```
+Documents/Objects/<yyyy-MM-dd HH.mm.ss>/   one object scan, object-capture/1:
+  manifest.json          name, device, box (object→world + size), supportPlane, mat, file index, viewCoverage, events
+  depth/frames.json      same records as house-capture/5 (room 0); depth/NNNNN.f16z/.conf/.jpg as below
+  photos/photos.json     same records as house-capture/5 (pass "object"); photos/NNNN.jpg
+  motion/imu.f64         Float64 rows: t qx qy qz qw gx gy gz rx ry rz ax ay az (t = seconds since boot)
+  features/points.json   [{ timestamp, ids, points }] ARKit feature points inside the box
+```
+
+The format reference is `.agents/skills/scan-to-stl/references/object-capture.md`.
 
 ## On disk
 

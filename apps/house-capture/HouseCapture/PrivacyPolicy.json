@@ -1,6 +1,6 @@
 {
   "title": "Privacy policy",
-  "updated": "October 7, 2026",
+  "updated": "October 23, 2026",
   "sections": [
     {
       "title": "Your scans stay under your control",
@@ -8,7 +8,7 @@
     },
     {
       "title": "What the app saves",
-      "body": "When you scan, the app uses the camera and LiDAR to save room geometry, reference photos, depth frames, camera poses, and tracking maps on your device. It also saves room names, scan times, device and system information, and technical diagnostics such as tracking errors and memory or thermal conditions. Photos and room geometry can reveal private details of your surroundings."
+      "body": "When you scan, the app uses the camera and LiDAR to save room geometry, reference photos, depth frames, camera poses, and tracking maps on your device. Object scans also record motion-sensor readings (device orientation, rotation rate and acceleration) while you scan, used to tell sharp depth frames from blurred ones, and the 3D feature points the camera tracks around the object. It also saves room names, scan times, device and system information, and technical diagnostics such as tracking errors and memory or thermal conditions. Photos and room geometry can reveal private details of your surroundings."
     },
     {
       "title": "Permissions",

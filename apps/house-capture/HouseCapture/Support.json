@@ -1,6 +1,6 @@
 {
   "title": "Help & support",
-  "updated": "October 7, 2026",
+  "updated": "October 23, 2026",
   "sections": [
     {
       "title": "Supported devices",
@@ -9,6 +9,10 @@
     {
       "title": "Scan a room",
       "body": "Create a house, choose Scan a room, and give the room a name. Allow camera access when prompted. Move slowly around the room in good light, keeping furniture and walls in view. Photos save automatically. Finish room keeps the available scan; you can stop before all surfaces have useful photos. Verify measurements before using them for precision work."
+    },
+    {
+      "title": "Scan a small object for 3D printing",
+      "body": "On the home screen choose Scan something to 3D print, then Scan an object. Point at the table until it is found, tap the object to place a box around it, adjust the box so it holds the whole object, and tap Start scanning. Walk slowly all the way around at 25–40 cm, low, level and from above, until the dots around the box turn green, then tap Finish. Share the scan as a ZIP and turn it into an STL on a computer with the scan-to-stl tools in the project repository. A printed capture mat under the object steadies tracking and gives a flat base. Matte, opaque objects work best. Measure the object with calipers before relying on its dimensions."
     },
     {
       "title": "Camera access is off",
