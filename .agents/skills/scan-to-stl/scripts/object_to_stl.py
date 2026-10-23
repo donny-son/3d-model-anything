@@ -322,7 +322,7 @@ def object_blob(P, seed_lo, seed_hi, limit_lo, limit_hi, cell=0.004, min_count=3
     """Extent of what stands on the plane (object frame, +Y up) around a seed rectangle: points
     above `min_height`, binned in `cell` squares, keeping the connected footprint blobs that touch
     the seed rectangle. Returns (lo, hi) with lo[1] = 0, or None."""
-    inside = ((P[:, 1] > min_height) & (P[:, 1] < 0.5) & (P[:, 0] > limit_lo[0]) & (P[:, 0] < limit_hi[0])
+    inside = ((P[:, 1] > min_height) & (P[:, 1] < limit_hi[1]) & (P[:, 0] > limit_lo[0]) & (P[:, 0] < limit_hi[0])
               & (P[:, 2] > limit_lo[2]) & (P[:, 2] < limit_hi[2]))
     obj = P[inside]
     if len(obj) < 50:
@@ -371,10 +371,12 @@ def object_frame(scan, frames, a, rng, info):
             info['planeRefit'] = None
         lo, hi = np.array([-size[0] / 2, 0, -size[2] / 2]), np.array([size[0] / 2, size[1], size[2] / 2])
         # the phone sizes the box from the one depth frame at the tap, which cannot see the far side:
-        # grow it to whatever the whole scan saw standing on the plane and touching the box
-        if a.grow_mm > 0 and info['planeRefit']:
+        # grow it to whatever the whole scan saw standing on the plane and touching the box (an
+        # explicit --box-size-mm is final; on an unconfirmed table, ignore the lowest 12 mm)
+        if a.grow_mm > 0 and not a.box_size_mm:
             g = a.grow_mm / 1000
-            blob = object_blob(transform(np.linalg.inv(T), world_pts), lo, hi, lo - g, hi + g)
+            blob = object_blob(transform(np.linalg.inv(T), world_pts), lo, hi, lo - g, hi + g,
+                               min_height=0.004 if info['planeRefit'] else 0.012)
             if blob is not None:
                 new_lo, new_hi = np.minimum(lo, blob[0]), np.maximum(hi, blob[1])
                 grown = np.r_[lo - new_lo, new_hi - hi] * 1000
@@ -397,12 +399,19 @@ def object_frame(scan, frames, a, rng, info):
     # footprint: the connected blob(s) at the aim point
     r = np.array([radius, 0.5, radius])
     blob = object_blob(P, np.array([-0.01, 0, -0.01]), np.array([0.01, 0, 0.01]), -r, r)
-    if blob is None:  # nothing right under the aim point: take the blob nearest to it
-        obj = P[(P[:, 1] > 0.004) & (np.hypot(P[:, 0], P[:, 2]) < radius)]
+    if blob is None:  # nothing right under the aim point: take the nearest real blob, not a speck of noise
+        obj = P[(P[:, 1] > 0.004) & (P[:, 1] < 0.5) & (np.hypot(P[:, 0], P[:, 2]) < radius)]
         if len(obj) < 100:
             raise SystemExit('no object points above the support plane near the aim point: pass --center or --radius-mm')
-        c = obj[np.argmin(np.hypot(obj[:, 0], obj[:, 2]))]
-        blob = object_blob(P, c - 0.004, c + 0.004, -r, r)
+        ij = np.floor((obj[:, [0, 2]] + radius) / 0.004).astype(int)
+        grid = np.zeros(ij.max(0) + 1, np.int32)
+        np.add.at(grid, (ij[:, 0], ij[:, 1]), 1)
+        lab = label_components(grid >= 3)[ij[:, 0], ij[:, 1]]
+        ids, counts = np.unique(lab[lab >= 0], return_counts=True)
+        obj = obj[np.isin(lab, ids[counts >= 100])]
+        if len(obj):
+            c = obj[np.argmin(np.hypot(obj[:, 0], obj[:, 2]))]
+            blob = object_blob(P, c - 0.004, c + 0.004, -r, r)
     if blob is None:
         raise SystemExit('object points are too sparse to outline: pass --center or --radius-mm')
     lo, hi = blob
@@ -699,22 +708,32 @@ def solid_field(vol, a, info):
         shell[:, cut_layer] = False
     info['unobservedSurfaceFraction'] = round(float((shell & ~seen).sum() / max(1, shell.sum())), 4)
     # the object ran into a side or the top of the volume and was cut flat there
-    walls = {'-x': solid[1], '+x': solid[-2], '-z': solid[:, :, 1], '+z': solid[:, :, -2], 'top': solid[:, -2]}
+    # (measured surface only: unseen space filled in out to the edge is the unobserved-surface warning's job)
+    met = solid & vol.grid(vol.band > 0)
+    walls = {'-x': met[1], '+x': met[-2], '-z': met[:, :, 1], '+z': met[:, :, -2], 'top': met[:, -2]}
     info['boxWallContact'] = [k for k, v in walls.items() if v.sum() > 20]
     return field, ys[cut_layer] if cut_layer < len(ys) else ys[-1]
 
 
 def thin_fraction(solid, r):
-    """Share of the solid that a cube of 2r+1 cells cannot reach (removed by a morphological opening):
-    walls and parts thinner than that."""
+    """Share of the solid that a roughly round probe 2r+1 cells across cannot reach (removed by a
+    morphological opening): walls and parts thinner than that. Alternating cube and cross steps keep
+    the probe close to a ball, so the edges of a thick part turned against the grid don't count."""
     m = np.pad(solid, r)
 
-    def morph(m, op):
+    def step(m, op, cube):
+        out = m.copy()
         for axis in range(3):
-            out = m.copy()
-            for k in range(1, r + 1):
-                out = op(out, op(np.roll(m, k, axis), np.roll(m, -k, axis)))
-            m = out
+            if cube:
+                shifted = op(np.roll(out, 1, axis), np.roll(out, -1, axis))
+                out = op(out, shifted)
+            else:
+                out = op(out, op(np.roll(m, 1, axis), np.roll(m, -1, axis)))
+        return out
+
+    def morph(m, op):
+        for k in range(r):
+            m = step(m, op, cube=k % 2 == 0)
         return m
 
     opened = morph(morph(m, np.logical_and), np.logical_or)
@@ -846,7 +865,7 @@ def mesh_report(V, F):
 
 # --- output -----------------------------------------------------------------------------
 
-def robust_extent(P, F, k, base_mm=2.0, cone_deg=10.0, band_mm=2.0, q=0.002):
+def robust_extent(P, F, k, base_mm=2.0, cone_deg=10.0, band_mm=0.5, q=0.002):
     """Extent along axis k (mm) as calipers would measure it, robust to LiDAR noise bumps: on each
     side, the area-weighted median position of the outermost surface facing that way (within
     `cone_deg`, within `band_mm` of the extreme), so a flat face counts at its mean position. Where
@@ -1042,12 +1061,13 @@ def main(argv=None):
     ap.add_argument('--max-turn-deg', type=float, default=3)
     ap.add_argument('--margin-mm', type=float, default=10, help='space added around the object box')
     ap.add_argument('--grow-mm', type=float, default=60,
-                    help="let the phone's box grow by up to this much to fit what the scan saw standing in it (0 = off)")
+                    help="let the phone's box grow by up to this much to fit what the scan saw standing in it "
+                         '(0 = off; not with --box-size-mm)')
     ap.add_argument('--cut-mm', type=float, default=1.0, help='ignore the table below this height; the base is extended back to it')
     ap.add_argument('--min-free', type=int, default=2, help='frames that must see through a voxel to call it empty')
     ap.add_argument('--smooth', type=int, default=16, help='Taubin smoothing iterations (0 = raw voxel surface)')
     ap.add_argument('--auto-box', action='store_true', help="ignore the phone's box; find the object automatically")
-    ap.add_argument('--box-size-mm', help='override the box size: W,H,D')
+    ap.add_argument('--box-size-mm', help="override the phone's box size, W,H,D in mm (used as is, not grown)")
     ap.add_argument('--center', help='auto box: world-space x,y,z (m) the object sits under')
     ap.add_argument('--radius-mm', type=float, default=150, help='auto box: search radius around the aim point')
     ap.add_argument('--scale', type=float, default=1.0, help='extra uniform scale')
@@ -1177,6 +1197,7 @@ def main(argv=None):
                             'pass --mat-width-mm); otherwise measure the object and use --calibrate')
     report = mesh_report(P, F)
     report['sizeMM'] = [round(float(v), 2) for v in P.max(0) - P.min(0)]
+    report['caliperMM'] = [round(robust_extent(P, F, k), 2) for k in range(3)]  # what --calibrate matches
     info['mesh'] = report
     info['viewCoverage'] = round(view_coverage(frames, (obj_lo + obj_hi) / 2), 3)
     fc = feature_check(scan, obj_to_world, V)
@@ -1194,16 +1215,19 @@ def main(argv=None):
         warnings.append(f'{info["unobservedSurfaceFraction"]:.0%} of the surface (not counting the base) was never measured '
                         'and was filled in as solid: rescan the missing sides, or treat those parts as guessed')
     if info.get('boxWallContact'):
+        fix = ('a larger --box-size-mm' if a.box_size_mm else
+               'a larger --margin-mm (e.g. 30) or --grow-mm' if info.get('box') != 'auto' else 'a larger --radius-mm')
         warnings.append(f'the object reaches the edge of the fusion volume ({", ".join(info["boxWallContact"])}) and was '
-                        'cut flat there: rerun with a larger --margin-mm (e.g. 30) or --grow-mm, or --auto-box')
+                        f'cut flat there: rerun with {fix}')
     if info.get('boxGrowthMM'):
         grown = ', '.join(f'{k} {v:g}' for k, v in info['boxGrowthMM'].items())
         warnings.append(f"the phone's box was too small and was grown to fit what stands on the table (mm: {grown}); "
                         'if that took in something next to the object, pass --grow-mm 0 or --box-size-mm W,H,D')
     if info['thinSolidFraction'] > 0.25:
         warnings.append(f'{info["thinSolidFraction"]:.0%} of the solid is thinner than ~{thin_mm:.0f} mm: fusion thickens such '
-                        'walls by up to ~1.3 mm on their less-seen (inner) side, so inner sizes come out small and walls '
-                        'under ~2 mm can get holes; measure a wall, or compare with --trunc-mm 2.5')
+                        'walls by up to ~1.5 mm on their less-seen (inner) side, so inner sizes come out small, and walls '
+                        'under ~2-3 mm can get holes (check mesh.genus); measure a wall'
+                        + ('' if a.trunc_mm <= 2.5 else '. --trunc-mm 2.5 thins them but opens holes in walls of ~3 mm or less'))
     if min(report['sizeMM']) < 15:
         warnings.append('features under ~3 mm are below what iPhone LiDAR resolves; expect rounded edges')
     pr = info.get('poseRefinement')
@@ -1226,7 +1250,8 @@ def main(argv=None):
     info['seconds'] = round(time.time() - t0, 1)
     with open(os.path.join(out, 'report.json'), 'w') as f:
         json.dump(info, f, indent=2)
-    print(f'{report["triangles"]:,} triangles, {report["sizeMM"][0]} x {report["sizeMM"][1]} x {report["sizeMM"][2]} mm, '
+    print(f'{report["triangles"]:,} triangles, {report["sizeMM"][0]} x {report["sizeMM"][1]} x {report["sizeMM"][2]} mm '
+          f'(caliper-like {report["caliperMM"][0]} x {report["caliperMM"][1]} x {report["caliperMM"][2]}), '
           f'{report["volumeMM3"] / 1000:.1f} cm3, watertight={report["watertight"]} -> {stl} ({info["seconds"]}s)')
     for w in warnings:
         print('warning:', w)

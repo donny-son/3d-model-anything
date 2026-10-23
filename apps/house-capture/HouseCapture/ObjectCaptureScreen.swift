@@ -53,8 +53,11 @@ struct ObjectCaptureScreen: View {
     HStack(alignment: .top) {
       Button {
         switch controller.phase {
-        case .done, .failed:
+        case .done:
           controller.close()
+          onClose()
+        case .failed:
+          if controller.hasRecording { controller.close() } else { controller.abandon() }
           onClose()
         case .saving:
           break
@@ -164,7 +167,10 @@ struct ObjectCaptureScreen: View {
       panel {
         Text(message).font(.subheadline)
         if controller.hasRecording {
-          Text("What was recorded is kept in the Objects list, where you can share or delete it.").font(.caption)
+          Text(controller.hasDepthIndex
+               ? "What was recorded is kept in the Objects list, where you can share or delete it."
+               : "What was recorded is kept in the Objects list until you delete it; it is too short to convert.")
+            .font(.caption)
         }
         Button("Close") {
           if controller.hasRecording { controller.close() } else { controller.abandon() }
@@ -286,7 +292,7 @@ struct ObjectLibraryScreen: View {
         "Matte, opaque objects from about 3 to 30 cm work best. Shiny, black or clear surfaces confuse the LiDAR.",
         "Set it on the printed capture mat (make_capture_mat.py) or a textured surface, away from other things.",
         "Keep 25–40 cm away and walk all the way around: low, level, then from above. Move slowly.",
-        "Measure one dimension with calipers; the STL step can scale the model to match it exactly.",
+        "Measure its longest side with calipers; the STL step can scale the model to match it.",
       ], id: \.self) { tip in
         Label(tip, systemImage: "smallcircle.filled.circle").font(.footnote).foregroundStyle(Fieldwork.secondary)
       }
@@ -298,7 +304,7 @@ struct ObjectLibraryScreen: View {
       Text(scan.name).font(.title3.bold())
       Text(summary(scan)).font(.footnote).foregroundStyle(Fieldwork.secondary)
       HStack {
-        if scan.manifest != nil {
+        if scan.manifest != nil || hasDepthIndex(scan) {
           Button { share(scan) } label: { Label("Share (.zip)", systemImage: "square.and.arrow.up") }
         }
         Spacer()
@@ -310,7 +316,11 @@ struct ObjectLibraryScreen: View {
   }
 
   private func summary(_ scan: ObjectScan) -> String {
-    guard let m = scan.manifest else { return "Incomplete: not saved (\(scan.id)). It can't be converted; delete it to free space." }
+    guard let m = scan.manifest else {
+      return hasDepthIndex(scan)
+        ? "Incomplete save (\(scan.id)). The depth frames are there, so it can still be shared and converted."
+        : "Incomplete: not saved (\(scan.id)). It can't be converted; delete it to free space."
+    }
     var parts = [m.createdAt.formatted(date: .abbreviated, time: .shortened), "\(m.depthFrameCount) depth frames", "\(m.photoCount) photos"]
     if let size = m.box?.size, size.count == 3 {
       parts.append(String(format: "box W %.0f · D %.0f · H %.0f mm", size[0] * 1000, size[2] * 1000, size[1] * 1000))
@@ -322,6 +332,10 @@ struct ObjectLibraryScreen: View {
 
   private func reload() {
     scans = ObjectScan.all()
+  }
+
+  private func hasDepthIndex(_ scan: ObjectScan) -> Bool {
+    FileManager.default.fileExists(atPath: scan.file("depth/frames.json").path)
   }
 
   private func start() {

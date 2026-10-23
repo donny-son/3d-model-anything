@@ -373,8 +373,8 @@ final class DepthRecorder: @unchecked Sendable {
     queue.async {
       // a frame whose depth didn't reach the disk (storage full) is left out of frames.json
       let saved = (try? ((try? (depthData as NSData).compressed(using: .zlib)) as Data? ?? depthData).write(to: self.bundle.file(record.file))) != nil
-      try? confData?.write(to: self.bundle.file(record.confidence))
-      if let cg, let rgb = record.rgb, let dest = CGImageDestinationCreateWithURL(self.bundle.file(rgb) as CFURL, "public.jpeg" as CFString, 1, nil) {
+      if saved { try? confData?.write(to: self.bundle.file(record.confidence)) }
+      if saved, let cg, let rgb = record.rgb, let dest = CGImageDestinationCreateWithURL(self.bundle.file(rgb) as CFURL, "public.jpeg" as CFString, 1, nil) {
         CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
         CGImageDestinationFinalize(dest)
       }

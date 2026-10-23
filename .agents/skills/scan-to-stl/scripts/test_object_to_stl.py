@@ -10,6 +10,7 @@ be closed and within tolerance of the true shape, and pose refinement must reduc
 usage: test_object_to_stl.py [--keep DIR]   (needs numpy; Pillow optional)
 """
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -30,14 +31,36 @@ TRUE_VOLUME_MM3 = 50 * 25 * 30 + math.pi * 12 ** 2 * 20
 W, H, FX, CX, CY = 256, 192, 212.0, 127.5, 95.5
 
 
+@contextlib.contextmanager
+def scene(box, cyl):
+    """Render and score a different object (box may be None: the cylinder alone)."""
+    global BOX, CYL
+    saved = BOX, CYL
+    BOX, CYL = box, cyl
+    try:
+        yield
+    finally:
+        BOX, CYL = saved
+
+
+def scene_bounds():
+    (cx, cz), r, top = CYL
+    lo, hi = np.array([cx - r, 0, cz - r]), np.array([cx + r, top, cz + r])
+    if BOX is not None:
+        lo, hi = np.minimum(lo, BOX[0]), np.maximum(hi, BOX[1])
+    return lo, hi
+
+
 def true_sdf(p):
     """Signed distance (m) to the true object, object frame (Y up)."""
-    c, h = (BOX[0] + BOX[1]) / 2, (BOX[1] - BOX[0]) / 2
-    q = np.abs(p - c) - h
-    box = np.linalg.norm(np.maximum(q, 0), axis=1) + np.minimum(q.max(1), 0)
     (cx, cz), r, top = CYL
     d = np.c_[np.hypot(p[:, 0] - cx, p[:, 2] - cz) - r, np.abs(p[:, 1] - top / 2) - top / 2]
     cyl = np.minimum(d.max(1), 0) + np.linalg.norm(np.maximum(d, 0), axis=1)
+    if BOX is None:
+        return cyl
+    c, h = (BOX[0] + BOX[1]) / 2, (BOX[1] - BOX[0]) / 2
+    q = np.abs(p - c) - h
+    box = np.linalg.norm(np.maximum(q, 0), axis=1) + np.minimum(q.max(1), 0)
     return np.minimum(box, cyl)
 
 
@@ -47,11 +70,12 @@ def cast(o, d):
     with np.errstate(divide='ignore', invalid='ignore'):
         tp = -o[1] / d[:, 1]
         t = np.where((d[:, 1] < 0) & (tp > 0), tp, t)
-        t0 = (BOX[0] - o) / d
-        t1 = (BOX[1] - o) / d
-        near = np.nanmax(np.minimum(t0, t1), axis=1)
-        far = np.nanmin(np.maximum(t0, t1), axis=1)
-        t = np.where((near <= far) & (near > 0), np.minimum(t, near), t)
+        if BOX is not None:
+            t0 = (BOX[0] - o) / d
+            t1 = (BOX[1] - o) / d
+            near = np.nanmax(np.minimum(t0, t1), axis=1)
+            far = np.nanmin(np.maximum(t0, t1), axis=1)
+            t = np.where((near <= far) & (near > 0), np.minimum(t, near), t)
         (cx, cz), r, top = CYL
         ox, oz = o[0] - cx, o[2] - cz
         a = d[:, 0] ** 2 + d[:, 2] ** 2
@@ -147,7 +171,8 @@ def make_scan(folder, rng, drift=True, with_box=True):
         json.dump(records, f)
     np.array(imu, '<f8').tofile(os.path.join(folder, 'motion/imu.f64'))
     # ARKit feature points: noisy samples of the true surface
-    pts = rng.uniform(BOX[0] - 0.005, BOX[1] + np.array([0.005, 0.025, 0.005]), (4000, 3))
+    lo, hi = scene_bounds()
+    pts = rng.uniform(lo - 0.005, hi + 0.005, (4000, 3))
     pts = pts[np.abs(true_sdf(pts)) < 0.0005][:80]
     features = [{'timestamp': 10 + j, 'ids': list(range(len(pts))),
                  'points': o2s.transform(obj_to_world, pts + rng.normal(0, 0.001, pts.shape)).tolist()}
@@ -180,7 +205,8 @@ def surface_error_mm(stl_path):
     rigid fit that best places the STL on the truth (shape error, not where the scan put it)."""
     tri = o2s.read_stl(stl_path).reshape(-1, 3).astype(np.float64)
     v = np.unique(tri, axis=0)
-    centre = np.array([(BOX[0][0] + BOX[1][0]) / 2, (BOX[0][2] + BOX[1][2]) / 2])
+    lo, hi = scene_bounds()
+    centre = np.array([(lo[0] + hi[0]) / 2, (lo[2] + hi[2]) / 2])
     best = None
     for quarter in range(4):  # squaring up the footprint leaves the turn about Z ambiguous
         r = math.radians(90 * quarter)
@@ -298,6 +324,24 @@ def main():
         cut = run(shallow, os.path.join(root, 'shallow-cut'), '--refine', '0', '--grow-mm', '0', '--no-preview')
         check(bool(cut['boxWallContact']) and any('cut flat' in w for w in cut['warnings']),
               'with growth off, the cut is reported')
+
+        print('\n== round object: calibrate on the diameter ==')
+        with scene(None, (np.array([0.0, 0.0]), 0.030, 0.040)):  # a can, 60 mm across, 40 mm tall
+            can = os.path.join(root, 'scan-can')
+            if os.path.exists(can):
+                shutil.rmtree(can)
+            make_scan(can, np.random.default_rng(3), drift=False)
+            box = ['--box-size-mm', '80,60,80', '--no-preview']
+            plain = run(can, os.path.join(root, 'can'), *box)
+            sized = run(can, os.path.join(root, 'can-cal'), *box, '--calibrate', 'x=60')
+            plain_err, _ = surface_error_mm(os.path.join(root, 'can', plain['stl']))
+            sized_err, _ = surface_error_mm(os.path.join(root, 'can-cal', sized['stl']))
+            volume = math.pi * 30 ** 2 * 40
+            print(f'can: caliper-like {plain["mesh"]["caliperMM"]}, surface error {plain_err:.2f} -> {sized_err:.2f} mm '
+                  f'calibrated, volume {sized["mesh"]["volumeMM3"] / volume - 1:+.1%}')
+            check(abs(sized['mesh']['caliperMM'][0] - 60) < 0.01, 'after --calibrate x=60 the reported caliper size is 60')
+            check(sized_err < plain_err + 0.02 and abs(sized['mesh']['volumeMM3'] / volume - 1) < 0.04,
+                  'calibrating a round object on its true diameter does not make it worse')
     finally:
         if not a.keep:
             shutil.rmtree(root, ignore_errors=True)

@@ -301,6 +301,8 @@ final class ObjectCaptureController: NSObject, ObservableObject {
   private var began = false
   private var closed = false
   private var lastStorageCheck: TimeInterval = 0
+  /// ARKit failed: nothing more can be recorded, only finished
+  private var sessionDead = false
 
   // box
   private var plane: PlaneEstimate?
@@ -611,6 +613,10 @@ final class ObjectCaptureController: NSObject, ObservableObject {
 
   func resume() {
     guard phase == .scanning, paused else { return }
+    guard !sessionDead else {
+      warning = "The camera stopped tracking, so the scan can't continue. Tap Finish to save what was recorded."
+      return
+    }
     do { try CaptureReadiness.requireStorage(at: scan.url, bytes: CaptureReadiness.pauseReserve) } catch {
       warning = error.localizedDescription
       return
@@ -817,6 +823,13 @@ final class ObjectCaptureController: NSObject, ObservableObject {
       depthFrameCount = depthRecorder.records.count
       phase = .done
     } catch {
+      // keep whatever index still writes, so a scan with enough frames stays convertible
+      if depthRecorder.records.count >= 10 {
+        try? depthRecorder.save()
+        try? scan.write(photos, to: "photos/photos.json")
+        try? scan.write(features, to: "features/points.json")
+        try? scan.write(manifest(), to: "manifest.json")
+      }
       phase = .failed("Couldn't save the scan: \(error.localizedDescription)")
     }
   }
@@ -851,6 +864,8 @@ final class ObjectCaptureController: NSObject, ObservableObject {
 
   /// Whether anything was recorded worth keeping after a failure
   var hasRecording: Bool { !depthRecorder.records.isEmpty || !photos.isEmpty }
+  /// Whether the depth index reached the disk, so the scan can be shared and converted
+  var hasDepthIndex: Bool { FileManager.default.fileExists(atPath: scan.file("depth/frames.json").path) }
 
   /// Leave without saving. The folder leaves the library at once and is deleted when the writes
   /// still in flight have finished (they fail harmlessly once it has moved).
@@ -893,7 +908,9 @@ final class ObjectCaptureController: NSObject, ObservableObject {
     guard !closed else { return }
     switch phase {
     case .scanning where depthRecorder.records.count >= 10:
+      sessionDead = true
       pause()
+      depthFrameCount = depthRecorder.records.count
       warning = "The camera stopped tracking (\(message)). Tap Finish to save what was recorded."
     case .saving, .done, .failed:
       break

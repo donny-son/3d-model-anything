@@ -40,9 +40,11 @@ u  = fx · pc.x / −pc.z + cx;  v = fy · −pc.y / −pc.z + cy
 the support plane, +Y the plane normal, X/Z along the box sides. `box.size` is width (x), height (y),
 depth (z) in metres. The app sizes it from the single depth frame at the tap, extended away from the
 camera to be at least as deep as it is wide, plus 1 cm, so it can still miss a handle or the far
-side. The pipeline therefore grows it (up to `--grow-mm`, default 60) to whatever the whole scan saw
-standing on the plane and touching it, adds `--margin-mm`, and warns if the object still reaches the
-edge of the volume (`boxWallContact`), where it would be cut flat.
+side. The pipeline therefore grows it (by up to `--grow-mm`, default 60, on every side including the
+top) to whatever the whole scan saw standing on the plane and touching it, adds `--margin-mm`, and
+warns if the measured surface still reaches the edge of the volume (`boxWallContact`), where it would
+be cut flat. When the table could not be confirmed from the depth (`planeRefit` null), growth ignores
+the lowest 12 mm. An explicit `--box-size-mm` is used as is, never grown.
 
 `supportPlane.source` says where the base came from: `mat` (tracked capture mat), `plane-anchor`
 (an ARKit horizontal plane whose extent reaches the tap, with `classification` such as `table`) or
@@ -79,7 +81,8 @@ Space no frame ever saw through (the underside, sealed cavities, deep occlusions
 result is always printable. `unobservedSurfaceFraction` is the share of the object's outer surface
 (not counting the base) that no depth frame measured, i.e. filled in rather than scanned; a solid
 interior is expected and not counted. `thinSolidFraction` is the share of the solid thinner than about
-twice the TSDF truncation (≈ 7 mm at the defaults); above 25 % the report warns (see Accuracy). The surface
+twice the TSDF truncation (a roughly round probe ≈ 7 mm across at the defaults); above 25 % the
+report warns (see Accuracy). The surface
 is extracted with marching tetrahedra (closed and manifold by construction), the table below
 `--cut-mm` is removed and the base extended back to the plane, and Taubin smoothing removes voxel
 steps without shrinking the object. The output is millimetres with Z up.
@@ -94,14 +97,19 @@ iPhone depth is about 1.5 mm per pixel at 30 cm and is smoothed by ARKit, so exp
 and lost detail below about 3 mm. Dark, shiny, transparent and very thin parts are unreliable.
 
 Thin walls are biased, not just noisy. A wall thinner than about twice the truncation (cups, bowls,
-vases, boxes) is seen far more from outside than inside, so fusion thickens it by about 0.5–1.3 mm on
-the inner side: inner diameters come out small and walls under about 2 mm can get holes. Calibrating on
-an outer dimension does not fix this; measure the wall or an inner size when it matters, and compare
-with `--trunc-mm 2.5`, which thins walls at the cost of a slightly noisier surface.
+vases, boxes) is seen far more from outside than inside, so fusion thickens it by about 0.5–1.5 mm on
+the inner side: inner diameters come out small, and walls under about 2–3 mm can get holes (watch
+`mesh.genus`: a solid without real handles should be 0 or a handful; tens or more means tunnels).
+Calibrating on an outer dimension does not fix this; measure the wall or an inner size when it
+matters. `--trunc-mm 2.5` thins such walls by a few tenths of a millimetre but opens holes in walls of
+about 3 mm or less, so keep it only if `mesh.genus` stays close to the default run's.
 
-`--calibrate axis=mm` measures the model the way calipers do: on each side, the area-weighted median
+`mesh.caliperMM` is the size `--calibrate axis=mm` works with: on each side, the area-weighted median
 position of the outermost surface facing that way, so single noise bumps and the base flare don't
-count. Calibrate on a long dimension between flat faces, measured away from the base; on the
-synthetic block, calibrating with the true size keeps the volume within 2 % and the mean surface error
-at 0.15–0.16 mm. A caliper value within a fraction of a millimetre of the reported size gains little.
-For critical fits, print a test piece.
+count. `sizeMM` is the plain bounding box, which reads about 0.5–1.5 mm larger. On the synthetic block
+and can, `caliperMM` comes within about 0.35 mm of the true sizes (49.90 × 30.12 × 44.94 mm for
+50 × 30 × 45; 59.87 × 59.65 × 39.97 for 60 × 60 × 40), and calibrating on the true length or diameter
+leaves the mean surface error the same or lower. Compare a caliper value with `caliperMM`, not
+`sizeMM`: if they agree within a few tenths of a millimetre, calibrating gains little. Calibrate on the
+longest dimension, between flat faces or across a round body away from the base; a short side
+magnifies any error. For critical fits, print a test piece.
