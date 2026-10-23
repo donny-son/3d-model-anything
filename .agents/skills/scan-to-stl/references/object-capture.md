@@ -38,15 +38,23 @@ u  = fx · pc.x / −pc.z + cx;  v = fy · −pc.y / −pc.z + cy
 
 `box.transform` maps the object frame to the world: origin at the centre of the box's bottom face on
 the support plane, +Y the plane normal, X/Z along the box sides. `box.size` is width (x), height (y),
-depth (z) in metres. The box is deliberately generous; the pipeline adds `--margin-mm` around it.
+depth (z) in metres. The app sizes it from the single depth frame at the tap, extended away from the
+camera to be at least as deep as it is wide, plus 1 cm, so it can still miss a handle or the far
+side. The pipeline therefore grows it (up to `--grow-mm`, default 60) to whatever the whole scan saw
+standing on the plane and touching it, adds `--margin-mm`, and warns if the object still reaches the
+edge of the volume (`boxWallContact`), where it would be cut flat.
 
 `supportPlane.source` says where the base came from: `mat` (tracked capture mat), `plane-anchor`
-(ARKit horizontal plane, with `classification` such as `table`) or `raycast` (no plane: a level plane
-through the tap). ARKit planes can sit millimetres off; the pipeline refits the plane on the depth.
+(an ARKit horizontal plane whose extent reaches the tap, with `classification` such as `table`) or
+`depth` (no plane: the lowest well-populated layer of LiDAR points under the tap). If none is found the
+app asks you to point at the table instead of guessing. ARKit planes can sit millimetres off; the
+pipeline refits the plane on the depth.
 
 `mat` (when the printed capture mat was seen): `physicalWidth` the app assumed (0.18 m), the last
 tracked pose, and `estimatedScaleFactor`, the median of ARKit's estimated / declared mat size
 (`scaleSpread` is half the 10–90 % range). About 1.00 means ARKit's metric scale agreed with the print.
+It measures the print as much as ARKit: a mat printed at 97 % ("fit to page") reads about 0.97, so
+pass the measured pattern width as `--mat-width-mm` before trusting `--mat-scale`.
 
 `motion`: `t` is seconds since boot, the same clock as frame and photo `timestamp`s. `q` is the
 CoreMotion attitude (xArbitraryZVertical reference, not the ARKit world), `g` gravity and `a` user
@@ -68,7 +76,10 @@ acceleration in g, `r` rotation rate in rad/s, all in the device frame.
 | View directions | `viewCoverage`: share of 12 × 3 directions around the object with frames |
 
 Space no frame ever saw through (the underside, sealed cavities, deep occlusions) becomes solid, so the
-result is always printable; `unobservedSolidFraction` says how much of the solid that is. The surface
+result is always printable. `unobservedSurfaceFraction` is the share of the object's outer surface
+(not counting the base) that no depth frame measured, i.e. filled in rather than scanned; a solid
+interior is expected and not counted. `thinSolidFraction` is the share of the solid thinner than about
+twice the TSDF truncation (≈ 7 mm at the defaults); above 25 % the report warns (see Accuracy). The surface
 is extracted with marching tetrahedra (closed and manifold by construction), the table below
 `--cut-mm` is removed and the base extended back to the plane, and Taubin smoothing removes voxel
 steps without shrinking the object. The output is millimetres with Z up.
@@ -80,5 +91,17 @@ silhouettes, ARKit-like drift) the mean surface error is about 0.2 mm, bounding 
 about 1.5 mm, and pose refinement cuts the error left by drift by about a quarter
 (mean 0.24 → 0.18 mm, 95th percentile 0.68 → 0.50 mm). Real scans are noisier.
 iPhone depth is about 1.5 mm per pixel at 30 cm and is smoothed by ARKit, so expect rounded edges
-and lost detail below about 3 mm. Dark, shiny, transparent and very thin parts are unreliable. For
-critical fits, calibrate against a caliper measurement and print a test piece.
+and lost detail below about 3 mm. Dark, shiny, transparent and very thin parts are unreliable.
+
+Thin walls are biased, not just noisy. A wall thinner than about twice the truncation (cups, bowls,
+vases, boxes) is seen far more from outside than inside, so fusion thickens it by about 0.5–1.3 mm on
+the inner side: inner diameters come out small and walls under about 2 mm can get holes. Calibrating on
+an outer dimension does not fix this; measure the wall or an inner size when it matters, and compare
+with `--trunc-mm 2.5`, which thins walls at the cost of a slightly noisier surface.
+
+`--calibrate axis=mm` measures the model the way calipers do: on each side, the area-weighted median
+position of the outermost surface facing that way, so single noise bumps and the base flare don't
+count. Calibrate on a long dimension between flat faces, measured away from the base; on the
+synthetic block, calibrating with the true size keeps the volume within 2 % and the mean surface error
+at 0.15–0.16 mm. A caliper value within a fraction of a millimetre of the reported size gains little.
+For critical fits, print a test piece.

@@ -48,11 +48,15 @@ usable full-triangle photo keep their cached vertex colors.
 ## Small objects (3D printing)
 
 Home → **Scan something to 3D print** → **Scan an object**. Point at the table until it is found,
-then tap the object: a box is sized from the LiDAR depth around the tap and drawn over it (sliders
-adjust footprint and height). **Start scanning** and walk slowly around it at 25–40 cm: low, level
+then tap the object: a box is sized from the LiDAR depth around the tap, extended back to cover the
+side the phone can't see yet, and drawn over it (sliders adjust footprint and height; the STL step
+grows it further from the whole scan). The table must be found first: an ARKit plane under the
+tap, the capture mat, or the table height in the depth. **Start scanning** and walk slowly around it at 25–40 cm: low, level
 and from above. Dots around the box (12 directions × 3 heights) turn green as each view is covered.
 **Finish** saves the scan; share it as a ZIP and run
-`.agents/skills/scan-to-stl/scripts/object_to_stl.py <folder>` on a computer to get the STL.
+`.agents/skills/scan-to-stl/scripts/object_to_stl.py <folder>` on a computer to get the STL. The
+screen stays awake while scanning; locking the phone or switching apps pauses it, and ARKit
+relocalizes into the same world when you come back.
 
 While scanning, a depth frame is kept (up to 10/s) only when tracking is normal, the object is in the
 middle of the view, 12–80 cm away, the gyro reads under 1.2 rad/s and the camera moved 1 cm or turned

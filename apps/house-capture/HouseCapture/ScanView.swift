@@ -371,14 +371,15 @@ final class DepthRecorder: @unchecked Sendable {
     let confData = depth.confidenceMap.map(Self.bytes)
     inFlight += 1
     queue.async {
-      try? ((try? (depthData as NSData).compressed(using: .zlib)) as Data? ?? depthData).write(to: self.bundle.file(record.file))
+      // a frame whose depth didn't reach the disk (storage full) is left out of frames.json
+      let saved = (try? ((try? (depthData as NSData).compressed(using: .zlib)) as Data? ?? depthData).write(to: self.bundle.file(record.file))) != nil
       try? confData?.write(to: self.bundle.file(record.confidence))
       if let cg, let rgb = record.rgb, let dest = CGImageDestinationCreateWithURL(self.bundle.file(rgb) as CFURL, "public.jpeg" as CFString, 1, nil) {
         CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
         CGImageDestinationFinalize(dest)
       }
       DispatchQueue.main.async {
-        self.records.append(record)
+        if saved { self.records.append(record) }
         self.inFlight -= 1
       }
     }

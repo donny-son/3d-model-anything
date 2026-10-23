@@ -58,14 +58,16 @@ On a LiDAR iPhone or iPad: **Scan something to 3D print** → **Scan an object**
 python3 .agents/skills/scan-to-stl/scripts/make_capture_mat.py -o capture-mat.pdf --paper letter
 ```
 
+Print it at 100 % ("Actual size") and check that the bar on the page measures 100 mm.
+
 Extract the scan into `data/captures-in/<object>/` and convert it (Python 3 with NumPy; Pillow for the preview):
 
 ```sh
 python3 .agents/skills/scan-to-stl/scripts/object_to_stl.py data/captures-in/mug
-python3 .agents/skills/scan-to-stl/scripts/object_to_stl.py data/captures-in/mug --calibrate x=82.4   # caliper-measured width
+python3 .agents/skills/scan-to-stl/scripts/object_to_stl.py data/captures-in/mug --calibrate x=82.4   # caliper-measured length
 ```
 
-`data/captures-in/mug/print/` then holds `mug.stl` (millimetres, Z up, flat base on Z = 0), a preview sheet and `report.json` with the size, volume, watertightness, pose corrections and warnings. The pipeline filters LiDAR depth by confidence and motion, refines every frame's ARKit pose against the fused model, re-levels the base on the table, and fills unseen space so the solid always prints. It also works on room sessions (`--room N --auto-box`). Read the [skill](.agents/skills/scan-to-stl/SKILL.md) for checks and fixes; `test_object_to_stl.py` runs a synthetic end-to-end accuracy test. Expect around 1 mm accuracy on matte objects. Shiny, black, transparent and very thin parts are harder; measure one dimension and calibrate when fit matters.
+`data/captures-in/mug/print/` then holds `mug.stl` (millimetres, Z up, flat base on Z = 0), a preview sheet and `report.json` with the size, volume, watertightness, pose corrections and warnings. The pipeline filters LiDAR depth by confidence and motion, refines every frame's ARKit pose against the fused model, re-levels the base on the table, and fills unseen space so the solid always prints. It also works on room sessions that include a slow circle around the object (`--room N`); if it can't find the object there, pass `--center x,y,z`. Read the [skill](.agents/skills/scan-to-stl/SKILL.md) for checks and fixes; `test_object_to_stl.py` runs a synthetic end-to-end accuracy test. Expect around 1 mm accuracy on matte objects. Shiny, black, transparent and very thin parts are harder, and thin walls (cups, boxes) come out up to ~1.3 mm too thick; measure one long dimension and calibrate when fit matters.
 
 ## Privacy and licensing
 

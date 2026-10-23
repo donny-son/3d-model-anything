@@ -85,7 +85,7 @@ def read_depth(folder, record):
     w, h = record['width'], record['height']
     with open(os.path.join(folder, record['file']), 'rb') as f:
         raw = f.read()
-    if record['file'].endswith('.f16z'):
+    if record['file'].endswith('.f16z') and len(raw) != w * h * 2:  # the app stores raw Float16 if compression fails
         raw = zlib.decompress(raw, -15)  # raw DEFLATE (Apple's .zlib compression)
     depth = np.frombuffer(raw, dtype='<f2').astype(F32).reshape(h, w)
     conf_path = os.path.join(folder, record.get('confidence') or '')
@@ -99,7 +99,7 @@ def read_depth(folder, record):
 def prepare_depth(depth, conf, K, a):
     """Surface depth (trusted pixels away from silhouettes), conservative carving depth, weights."""
     z = np.where(np.isfinite(depth), depth, 0).astype(F32)
-    valid = (z > a.min_depth) & (z < a.max_depth) & (conf >= 1)
+    valid = (z > a.min_depth) & (z < a.max_depth) & (conf >= min(1, a.min_confidence))
     z = np.where(valid, z, 0)
     # flying pixels: LiDAR mixes foreground and background along silhouettes
     p = np.pad(z, 1, mode='edge')
@@ -193,7 +193,11 @@ def select_frames(scan, a, stats):
         keep = [keep[i] for i in idx]
     frames = []
     for r in keep:
-        depth, conf = read_depth(scan.folder, r)
+        try:
+            depth, conf = read_depth(scan.folder, r)
+        except (OSError, zlib.error, ValueError):  # missing or truncated file (e.g. storage ran out mid-scan)
+            stats['unreadable'] = stats.get('unreadable', 0) + 1
+            continue
         K = np.array(r['intrinsics'], dtype=np.float64).reshape(3, 3).T
         surf, carve, weight = prepare_depth(depth, conf, K, a)
         if (surf > 0).sum() < 200:
@@ -277,27 +281,78 @@ def sample_world_points(frames, every=3, stride=4):
     return np.concatenate(pts) if pts else np.zeros((0, 3))
 
 
-def look_at_point(frames):
-    """Least-squares meeting point of all optical axes: where an orbit capture was aimed."""
-    A = np.zeros((3, 3))
-    b = np.zeros(3)
-    for fr in frames:
-        c, f = fr.cam_to_world[:3, 3], fr.cam_to_world[:3, 2]
-        P = np.eye(3) - np.outer(f, f)
-        A += P
-        b += P @ c
-    return np.linalg.solve(A + 1e-9 * np.eye(3), b)
+def look_at_point(frames, max_depth=1.0, tol=0.05, iters=2000, seed=0):
+    """Point most optical axes pass within `tol` of, in front of the camera and in depth range,
+    refined by least squares over those frames: where an orbit was aimed, even when a room
+    session also holds frames facing walls and furniture."""
+    C = np.array([fr.cam_to_world[:3, 3] for fr in frames])
+    F = np.array([fr.cam_to_world[:3, 2] for fr in frames])
+
+    def lsq(m):
+        P = np.eye(3)[None] - F[m, :, None] * F[m, None, :]
+        return np.linalg.solve(P.sum(0) + 1e-9 * np.eye(3), np.einsum('nij,nj->i', P, C[m]))
+
+    def support(x):
+        v = x - C
+        along = (v * F).sum(1)
+        dist = np.linalg.norm(v - along[:, None] * F, axis=1)
+        return (dist < tol) & (along > 0.05) & (along < max_depth + tol)
+
+    rng = np.random.default_rng(seed)
+    best = None
+    for _ in range(iters if len(frames) > 2 else 0):
+        i, j = rng.choice(len(frames), 2, replace=False)
+        b, w = F[i] @ F[j], C[i] - C[j]
+        den = 1 - b * b
+        if den < 1e-6:
+            continue
+        s = (b * (F[j] @ w) - F[i] @ w) / den
+        t = (F[j] @ w - b * (F[i] @ w)) / den
+        p, q = C[i] + s * F[i], C[j] + t * F[j]
+        if np.linalg.norm(p - q) < 2 * tol:
+            m = support((p + q) / 2)
+            if best is None or m.sum() > best.sum():
+                best = m
+    if best is None or best.sum() < 10:
+        best = np.ones(len(frames), bool)
+    return lsq(best)
+
+
+def object_blob(P, seed_lo, seed_hi, limit_lo, limit_hi, cell=0.004, min_count=3, min_height=0.004):
+    """Extent of what stands on the plane (object frame, +Y up) around a seed rectangle: points
+    above `min_height`, binned in `cell` squares, keeping the connected footprint blobs that touch
+    the seed rectangle. Returns (lo, hi) with lo[1] = 0, or None."""
+    inside = ((P[:, 1] > min_height) & (P[:, 1] < 0.5) & (P[:, 0] > limit_lo[0]) & (P[:, 0] < limit_hi[0])
+              & (P[:, 2] > limit_lo[2]) & (P[:, 2] < limit_hi[2]))
+    obj = P[inside]
+    if len(obj) < 50:
+        return None
+    ij = np.floor((obj[:, [0, 2]] - limit_lo[[0, 2]]) / cell).astype(int)
+    grid = np.zeros(ij.max(0) + 1, np.int32)
+    np.add.at(grid, (ij[:, 0], ij[:, 1]), 1)
+    labels = label_components(grid >= min_count)
+    lab = labels[ij[:, 0], ij[:, 1]]
+    seed = (lab >= 0) & np.all(obj[:, [0, 2]] > seed_lo[[0, 2]], 1) & np.all(obj[:, [0, 2]] < seed_hi[[0, 2]], 1)
+    if not seed.any():
+        return None
+    o = obj[np.isin(lab, np.unique(lab[seed]))]
+    lo, hi = np.percentile(o, 0.5, axis=0), np.percentile(o, 99.5, axis=0)
+    lo[1] = 0.0
+    return lo, hi
 
 
 def object_frame(scan, frames, a, rng, info):
-    """object -> world 4x4 (origin on the support plane, +Y up) and the box size (w, h, d) in m."""
+    """object -> world 4x4 (origin on the support plane, +Y up) and the object's extent in that
+    frame as (lo, hi) corners in metres (lo[1] = 0, the plane)."""
     world_pts = sample_world_points(frames)
+    mat_info = scan.manifest.get('mat') or {}
+    if mat_info:
+        info['mat'] = {k: mat_info.get(k) for k in ('physicalWidth', 'estimatedScaleFactor', 'samples', 'scaleSpread')}
     box = scan.manifest.get('box')
     if box and not a.auto_box:
         T = mat(box['transform'])
         size = np.array(box['size'], dtype=np.float64)
         info['box'] = 'manifest'
-        mat_info = scan.manifest.get('mat') or {}
         info['planeSource'] = (scan.manifest.get('supportPlane') or {}).get('source', 'manifest')
         if a.box_size_mm:
             size = np.array([float(v) for v in a.box_size_mm.split(',')]) / 1000
@@ -314,11 +369,21 @@ def object_frame(scan, frames, a, rng, info):
             info['planeSource'] += ' + depth refit'
         else:
             info['planeRefit'] = None
-        if mat_info:
-            info['mat'] = {k: mat_info.get(k) for k in ('physicalWidth', 'estimatedScaleFactor', 'samples', 'scaleSpread')}
-        return T, size
+        lo, hi = np.array([-size[0] / 2, 0, -size[2] / 2]), np.array([size[0] / 2, size[1], size[2] / 2])
+        # the phone sizes the box from the one depth frame at the tap, which cannot see the far side:
+        # grow it to whatever the whole scan saw standing on the plane and touching the box
+        if a.grow_mm > 0 and info['planeRefit']:
+            g = a.grow_mm / 1000
+            blob = object_blob(transform(np.linalg.inv(T), world_pts), lo, hi, lo - g, hi + g)
+            if blob is not None:
+                new_lo, new_hi = np.minimum(lo, blob[0]), np.maximum(hi, blob[1])
+                grown = np.r_[lo - new_lo, new_hi - hi] * 1000
+                if grown.max() > 2:
+                    info['boxGrowthMM'] = {k: round(float(v), 1) for k, v in zip(('-x', '-y', '-z', '+x', '+y', '+z'), grown) if v > 2}
+                    lo, hi = new_lo, new_hi
+        return T, lo, hi
     # no box: find the object where the cameras converge, on the plane below that point
-    target = look_at_point(frames)
+    target = look_at_point(frames, a.max_depth)
     if a.center:
         target = np.array([float(v) for v in a.center.split(',')])
     radius = a.radius_mm / 1000
@@ -327,33 +392,26 @@ def object_frame(scan, frames, a, rng, info):
     if plane is None:
         raise SystemExit('could not find a support plane under the object: pass --center x,y,z (world metres)')
     n, d = plane['normal'], plane['d']
-    h = near @ n - d
     T = frame_on_plane(n, target - (target @ n - d) * n, np.array([1.0, 0, 0]))
     P = transform(np.linalg.inv(T), near)
-    obj = P[(h > 0.004) & (h < 0.5) & (np.hypot(P[:, 0], P[:, 2]) < radius)]
-    if len(obj) < 100:
-        raise SystemExit('no object points above the support plane near the aim point: pass --center or --radius-mm')
-    # footprint: the 2D connected blob nearest the aim point
-    cell = 0.004
-    ij = np.floor(obj[:, [0, 2]] / cell).astype(int)
-    ij -= ij.min(0)
-    grid = np.zeros(ij.max(0) + 1, np.int32)
-    np.add.at(grid, (ij[:, 0], ij[:, 1]), 1)
-    labels = label_components(grid >= 3)
-    lab = labels[ij[:, 0], ij[:, 1]]
-    ok = lab >= 0
-    if not ok.any():
+    # footprint: the connected blob(s) at the aim point
+    r = np.array([radius, 0.5, radius])
+    blob = object_blob(P, np.array([-0.01, 0, -0.01]), np.array([0.01, 0, 0.01]), -r, r)
+    if blob is None:  # nothing right under the aim point: take the blob nearest to it
+        obj = P[(P[:, 1] > 0.004) & (np.hypot(P[:, 0], P[:, 2]) < radius)]
+        if len(obj) < 100:
+            raise SystemExit('no object points above the support plane near the aim point: pass --center or --radius-mm')
+        c = obj[np.argmin(np.hypot(obj[:, 0], obj[:, 2]))]
+        blob = object_blob(P, c - 0.004, c + 0.004, -r, r)
+    if blob is None:
         raise SystemExit('object points are too sparse to outline: pass --center or --radius-mm')
-    dist = np.hypot(obj[:, 0], obj[:, 2])
-    target_label = lab[ok][np.argmin(dist[ok])]
-    o = obj[lab == target_label]
-    lo, hi = np.percentile(o, 0.5, axis=0), np.percentile(o, 99.5, axis=0)
+    lo, hi = blob
     center = np.array([(lo[0] + hi[0]) / 2, 0, (lo[2] + hi[2]) / 2])
     T = T @ frame_on_plane(np.array([0, 1.0, 0]), center, np.array([1.0, 0, 0]))
     info['box'] = 'auto'
     info['planeSource'] = 'depth RANSAC'
     info['planeRefit'] = {'rmsMM': round(plane['rmsMM'], 2), 'inliers': plane['inliers']}
-    return T, np.array([hi[0] - lo[0], hi[1], hi[2] - lo[2]])
+    return T, lo - center, hi - center
 
 
 # --- connected components ---------------------------------------------------------------
@@ -625,9 +683,42 @@ def solid_field(vol, a, info):
     voids = (~solid) & (air != outside)
     info['filledVoidVoxels'] = int(voids.sum())
     solid |= voids
-    field = np.where(solid, np.minimum(t, -1e-3), np.maximum(t, 1e-3)).astype(F32)
-    info['unobservedSolidFraction'] = round(float((solid & ~seen).sum() / max(1, solid.sum())), 4)
+    # cells whose sign was forced (cut, border, dropped parts, filled voids) get a clear value, so
+    # the surface crosses well inside the cell instead of in micron-thin slivers
+    forced = solid != (t < 0)
+    field = np.where(solid, np.where(forced, -0.5, np.minimum(t, -1e-3)),
+                     np.where(forced, 0.5, np.maximum(t, 1e-3))).astype(F32)
+    # the outermost solid cells (not the base, which is always the flat extension to the table)
+    # that no depth frame measured: filled in, not scanned. The interior never counts.
+    shell = np.zeros_like(solid)
+    for axis in range(3):
+        for shift in (1, -1):
+            shell |= np.roll(~solid, shift, axis)  # the border is air, so wrapping is harmless
+    shell &= solid
+    if cut_layer < solid.shape[1]:
+        shell[:, cut_layer] = False
+    info['unobservedSurfaceFraction'] = round(float((shell & ~seen).sum() / max(1, shell.sum())), 4)
+    # the object ran into a side or the top of the volume and was cut flat there
+    walls = {'-x': solid[1], '+x': solid[-2], '-z': solid[:, :, 1], '+z': solid[:, :, -2], 'top': solid[:, -2]}
+    info['boxWallContact'] = [k for k, v in walls.items() if v.sum() > 20]
     return field, ys[cut_layer] if cut_layer < len(ys) else ys[-1]
+
+
+def thin_fraction(solid, r):
+    """Share of the solid that a cube of 2r+1 cells cannot reach (removed by a morphological opening):
+    walls and parts thinner than that."""
+    m = np.pad(solid, r)
+
+    def morph(m, op):
+        for axis in range(3):
+            out = m.copy()
+            for k in range(1, r + 1):
+                out = op(out, op(np.roll(m, k, axis), np.roll(m, -k, axis)))
+            m = out
+        return m
+
+    opened = morph(morph(m, np.logical_and), np.logical_or)
+    return float((m & ~opened).sum() / max(1, m.sum()))
 
 
 # Kuhn split of a cube into 6 tetrahedra around its main diagonal (corner c = x + 2y + 4z):
@@ -754,6 +845,34 @@ def mesh_report(V, F):
 
 
 # --- output -----------------------------------------------------------------------------
+
+def robust_extent(P, F, k, base_mm=2.0, cone_deg=10.0, band_mm=2.0, q=0.002):
+    """Extent along axis k (mm) as calipers would measure it, robust to LiDAR noise bumps: on each
+    side, the area-weighted median position of the outermost surface facing that way (within
+    `cone_deg`, within `band_mm` of the extreme), so a flat face counts at its mean position. Where
+    nothing faces that way (a tip or an edge), the outermost `q` of the area is ignored instead.
+    For X/Y the extended base flare is left out."""
+    tri = P[F]
+    c = tri.mean(1)
+    n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    area = 0.5 * np.linalg.norm(n, axis=1)
+    n /= np.maximum(2 * area[:, None], 1e-20)
+    keep = area > 0
+    if k < 2 and np.ptp(P[:, 2]) > 4 * base_mm:
+        keep &= c[:, 2] > P[:, 2].min() + base_mm
+    ends = []
+    for sign in (1.0, -1.0):
+        x = sign * c[:, k]
+        facing = keep & (sign * n[:, k] > math.cos(math.radians(cone_deg)))
+        if facing.any():
+            facing &= x > x[facing].max() - band_mm
+        sel = facing if area[facing].sum() > 2.0 else keep
+        xs, ws = x[sel], area[sel]
+        o = np.argsort(xs)
+        cw = np.cumsum(ws[o]) / ws.sum()
+        ends.append(sign * xs[o][np.searchsorted(cw, 0.5 if sel is facing else 1 - q)])
+    return float(ends[0] - ends[1])
+
 
 def footprint_yaw(P):
     """Rotation about Z (rad) that makes the footprint's bounding rectangle smallest, long side on X."""
@@ -922,6 +1041,8 @@ def main(argv=None):
     ap.add_argument('--max-shift-mm', type=float, default=15)
     ap.add_argument('--max-turn-deg', type=float, default=3)
     ap.add_argument('--margin-mm', type=float, default=10, help='space added around the object box')
+    ap.add_argument('--grow-mm', type=float, default=60,
+                    help="let the phone's box grow by up to this much to fit what the scan saw standing in it (0 = off)")
     ap.add_argument('--cut-mm', type=float, default=1.0, help='ignore the table below this height; the base is extended back to it')
     ap.add_argument('--min-free', type=int, default=2, help='frames that must see through a voxel to call it empty')
     ap.add_argument('--smooth', type=int, default=16, help='Taubin smoothing iterations (0 = raw voxel surface)')
@@ -952,27 +1073,31 @@ def main(argv=None):
     frames = select_frames(scan, a, stats)
     stats['used'] = len(frames)
     info['frames'] = stats
-    print(f'{len(frames)} of {len(scan.records)} depth frames usable ({stats["motion"]} too fast, {stats["noDepth"]} without depth)')
+    print(f'{len(frames)} of {len(scan.records)} depth frames usable ({stats["motion"]} too fast, {stats["noDepth"]} without depth'
+          f'{", %d unreadable" % stats["unreadable"] if stats.get("unreadable") else ""})')
+    if stats.get('unreadable'):
+        warnings.append(f'{stats["unreadable"]} depth frame files were missing or damaged and were skipped')
     if len(frames) < 10:
         raise SystemExit('fewer than 10 usable depth frames')
     if scan.motion is None:
         warnings.append('no IMU samples: fast-motion frames were judged from pose deltas only')
 
     # 2. object frame
-    obj_to_world, size = object_frame(scan, frames, a, rng, info)
+    obj_to_world, obj_lo, obj_hi = object_frame(scan, frames, a, rng, info)
     world_to_obj = np.linalg.inv(obj_to_world)
     for fr in frames:
         fr.T0 = world_to_obj @ fr.cam_to_world
         fr.T = fr.T0.copy()
     m = a.margin_mm / 1000
-    lo = np.array([-size[0] / 2 - m, -max(0.006, 4 * a.voxel_mm / 1000), -size[2] / 2 - m])
-    hi = np.array([size[0] / 2 + m, size[1] + m, size[2] / 2 + m])
+    lo = obj_lo - m
+    lo[1] = -max(0.006, 4 * a.voxel_mm / 1000)
+    hi = obj_hi + m
     voxel = a.voxel_mm / 1000
     while np.prod(np.ceil((hi - lo) / voxel) + 1) > 16e6:
         voxel *= 1.25
     if voxel > a.voxel_mm / 1000 * 1.01:
         warnings.append(f'box is large: voxel raised to {voxel * 1000:.2f} mm (shrink the box or pass --box-size-mm)')
-    info['boxMM'] = [round(float(v) * 1000, 1) for v in size]
+    info['boxMM'] = [round(float(v) * 1000, 1) for v in obj_hi - obj_lo]
     info['objectToWorld'] = column_major(obj_to_world)
     print(f'object box {info["boxMM"]} mm ({info["box"]}), plane: {info["planeSource"]}')
 
@@ -998,6 +1123,9 @@ def main(argv=None):
 
     # 5. solid -> mesh
     field, base_y = solid_field(vol, a, info)
+    r = max(1, int(round(vol.trunc / voxel)) - 1)
+    info['thinSolidFraction'] = round(thin_fraction(field < 0, r), 3)
+    thin_mm = (2 * r + 1) * voxel * 1000
     V, F = marching_tetrahedra(field, vol.origin, voxel)
     if len(F) == 0:
         raise SystemExit('empty surface')
@@ -1022,26 +1150,35 @@ def main(argv=None):
         if mat_error:
             scale /= mat_error
             scale_source = 'capture mat'
+            if not a.mat_width_mm:
+                warnings.append(f'--mat-scale assumed the mat printed at exactly {declared:.0f} mm: check the 100 mm bar '
+                                'and pass --mat-width-mm if it is off')
         else:
             warnings.append('--mat-scale: this scan has no capture-mat scale estimate')
     if a.calibrate:
         axis, value = a.calibrate.split('=')
         k = 'xyz'.index(axis.strip().lower())
-        measured = (P[:, k].max() - P[:, k].min()) * scale
+        raw = (P[:, k].max() - P[:, k].min()) * scale
+        measured = robust_extent(P, F, k) * scale
         scale *= float(value) / measured
-        scale_source = f'calibrated {axis}={value} mm (measured {measured:.2f})'
+        scale_source = f'calibrated {axis}={value} mm (measured {measured:.2f}, bounding box {raw:.2f})'
     P *= scale
     P[:, :2] -= (P[:, :2].min(0) + P[:, :2].max(0)) / 2
     P[:, 2] -= P[:, 2].min()
     info['scale'] = {'applied': round(scale, 6), 'source': scale_source,
                      'matScaleError': round(mat_error, 5) if mat_error else None}
     if mat_error and not a.mat_scale and not a.calibrate and abs(mat_error - 1) > 0.02:
-        warnings.append(f'the capture mat suggests ARKit scale is off by {abs(mat_error - 1):.1%}: '
-                        'measure the object and use --calibrate (or --mat-scale)')
+        if a.mat_width_mm:
+            warnings.append(f'the capture mat suggests ARKit scale is off by {abs(mat_error - 1):.1%}: '
+                            'measure the object and use --calibrate (or --mat-scale)')
+        else:
+            warnings.append(f'the capture mat measured {abs(mat_error - 1):.1%} {"smaller" if mat_error < 1 else "larger"} '
+                            f'than its declared {declared:.0f} mm: usually the print was scaled (check the 100 mm bar and '
+                            'pass --mat-width-mm); otherwise measure the object and use --calibrate')
     report = mesh_report(P, F)
     report['sizeMM'] = [round(float(v), 2) for v in P.max(0) - P.min(0)]
     info['mesh'] = report
-    info['viewCoverage'] = round(view_coverage(frames, np.array([0, size[1] / 2, 0])), 3)
+    info['viewCoverage'] = round(view_coverage(frames, (obj_lo + obj_hi) / 2), 3)
     fc = feature_check(scan, obj_to_world, V)
     if fc:
         info['featurePointCheck'] = fc
@@ -1053,9 +1190,20 @@ def main(argv=None):
         warnings.append('mesh is not closed/consistently oriented: please report this scan')
     if info['viewCoverage'] < 0.5:
         warnings.append(f'only {info["viewCoverage"]:.0%} of view directions were recorded: orbit the object at 2-3 heights')
-    if info['unobservedSolidFraction'] > 0.6:
-        warnings.append(f'{info["unobservedSolidFraction"]:.0%} of the solid was never seen by the LiDAR (filled as solid): '
-                        'overhangs and the underside are guessed')
+    if info['unobservedSurfaceFraction'] > 0.2:
+        warnings.append(f'{info["unobservedSurfaceFraction"]:.0%} of the surface (not counting the base) was never measured '
+                        'and was filled in as solid: rescan the missing sides, or treat those parts as guessed')
+    if info.get('boxWallContact'):
+        warnings.append(f'the object reaches the edge of the fusion volume ({", ".join(info["boxWallContact"])}) and was '
+                        'cut flat there: rerun with a larger --margin-mm (e.g. 30) or --grow-mm, or --auto-box')
+    if info.get('boxGrowthMM'):
+        grown = ', '.join(f'{k} {v:g}' for k, v in info['boxGrowthMM'].items())
+        warnings.append(f"the phone's box was too small and was grown to fit what stands on the table (mm: {grown}); "
+                        'if that took in something next to the object, pass --grow-mm 0 or --box-size-mm W,H,D')
+    if info['thinSolidFraction'] > 0.25:
+        warnings.append(f'{info["thinSolidFraction"]:.0%} of the solid is thinner than ~{thin_mm:.0f} mm: fusion thickens such '
+                        'walls by up to ~1.3 mm on their less-seen (inner) side, so inner sizes come out small and walls '
+                        'under ~2 mm can get holes; measure a wall, or compare with --trunc-mm 2.5')
     if min(report['sizeMM']) < 15:
         warnings.append('features under ~3 mm are below what iPhone LiDAR resolves; expect rounded edges')
     pr = info.get('poseRefinement')

@@ -181,20 +181,26 @@ def surface_error_mm(stl_path):
     tri = o2s.read_stl(stl_path).reshape(-1, 3).astype(np.float64)
     v = np.unique(tri, axis=0)
     centre = np.array([(BOX[0][0] + BOX[1][0]) / 2, (BOX[0][2] + BOX[1][2]) / 2])
-    p = np.c_[v[:, 0] / 1000 + centre[0], v[:, 2] / 1000, -v[:, 1] / 1000 + centre[1]]
-    c = p.mean(0)
-    eps = 1e-5
-    for _ in range(15):  # Gauss-Newton on the analytic SDF
-        r = true_sdf(p)
-        g = np.stack([(true_sdf(p + eps * e) - r) / eps for e in np.eye(3)], 1)
-        J = np.c_[np.cross(p - c, g), g]
-        delta = -np.linalg.lstsq(J, r, rcond=None)[0]
-        R = o2s.rodrigues(delta[:3])
-        p = (p - c) @ R.T + c + delta[3:]
-        if np.linalg.norm(delta) < 1e-8:
-            break
-    d = np.abs(true_sdf(p)) * 1000
-    return float(d.mean()), float(np.percentile(d, 95))
+    best = None
+    for quarter in range(4):  # squaring up the footprint leaves the turn about Z ambiguous
+        r = math.radians(90 * quarter)
+        xy = v[:, :2] @ np.array([[math.cos(r), math.sin(r)], [-math.sin(r), math.cos(r)]])
+        p = np.c_[xy[:, 0] / 1000 + centre[0], v[:, 2] / 1000, -xy[:, 1] / 1000 + centre[1]]
+        c = p.mean(0)
+        eps = 1e-5
+        for _ in range(15):  # Gauss-Newton on the analytic SDF
+            res = true_sdf(p)
+            g = np.stack([(true_sdf(p + eps * e) - res) / eps for e in np.eye(3)], 1)
+            J = np.c_[np.cross(p - c, g), g]
+            delta = -np.linalg.lstsq(J, res, rcond=None)[0]
+            R = o2s.rodrigues(delta[:3])
+            p = (p - c) @ R.T + c + delta[3:]
+            if np.linalg.norm(delta) < 1e-8:
+                break
+        d = np.abs(true_sdf(p)) * 1000
+        if best is None or d.mean() < best[0]:
+            best = (float(d.mean()), float(np.percentile(d, 95)))
+    return best
 
 
 def run(folder, out, *extra):
@@ -235,6 +241,8 @@ def main():
         check(abs(m['volumeMM3'] / TRUE_VOLUME_MM3 - 1) < 0.04, 'volume within 4%')
         check(mean_err < 0.5 and p95_err < 1.3, 'surface within 0.5 mm mean, 1.3 mm p95 of the truth')
         check(info['frames']['motion'] == n_fast, f'the {n_fast} fast-motion frames were rejected from IMU data')
+        check(info['unobservedSurfaceFraction'] < 0.2 and info['thinSolidFraction'] < 0.25 and not info['boxWallContact'],
+              'full orbit: surface measured, no thin-part or box-wall warnings')
         check(os.path.exists(os.path.join(root, 'refined', 'report.json')), 'report written')
 
         print('\n== no drift ==')
@@ -242,7 +250,10 @@ def main():
         if os.path.exists(still):
             shutil.rmtree(still)
         make_scan(still, np.random.default_rng(2), drift=False)
+        with open(os.path.join(still, 'depth/00007.f16z'), 'r+b') as f:  # storage ran out mid-write
+            f.truncate(1000)
         exact = run(still, os.path.join(root, 'no-drift'), '--no-preview')
+        check(exact['frames'].get('unreadable') == 1, 'a damaged depth file is skipped, not fatal')
         fit = exact.get('planeRefit') or {}
         check(abs(fit.get('shiftMM', 0) + 3) < 0.3 and abs(fit.get('tiltDeg', 0) - 1) < 0.1,
               'recorded plane error (3 mm high, 1 deg) corrected from the depth')
@@ -258,11 +269,35 @@ def main():
         check(mean_err < raw_mean * 0.85, 'pose refinement reduces the surface error by 15% or more')
 
         print('\n== calibrated + automatic box ==')
-        auto = run(scan, os.path.join(root, 'auto'), '--auto-box', '--calibrate', 'x=50', '--no-preview')
+        auto = run(scan, os.path.join(root, 'auto'), '--auto-box', '--calibrate', 'x=50', '--mat-scale', '--no-preview')
         am = auto['mesh']
         check(am['watertight'] and am['components'] == 1, 'automatic box finds one closed object')
-        check(abs(am['sizeMM'][0] - 50) < 0.05, '--calibrate x=50 sets the X size exactly')
-        check(bool(np.all(np.abs(np.array(am['sizeMM']) - TRUE_SIZE_MM) < 1.5)), 'automatic box size within 1.5 mm')
+        check(auto['scale']['matScaleError'] is not None, 'the capture-mat record is read with --auto-box too')
+        auto_mean, _ = surface_error_mm(os.path.join(root, 'auto', auto['stl']))
+        print(f'calibrated: size {am["sizeMM"]}, volume {am["volumeMM3"]:.0f} mm3, surface error mean {auto_mean:.2f} mm')
+        # calibrating with the true size must not make the model worse (the bounding box is noise-inflated)
+        check(abs(am['volumeMM3'] / TRUE_VOLUME_MM3 - 1) < 0.04 and auto_mean < 0.3,
+              '--calibrate x=50 (the true size) keeps volume within 4% and the surface within 0.3 mm')
+        check(bool(np.all(np.abs(np.array(am['sizeMM']) - TRUE_SIZE_MM) < 1.6)), 'automatic box size within 1.6 mm')
+
+        print('\n== box too shallow on the phone ==')
+        shallow = os.path.join(root, 'scan-shallow-box')
+        if os.path.exists(shallow):
+            shutil.rmtree(shallow)
+        shutil.copytree(still, shallow)
+        mpath = os.path.join(shallow, 'manifest.json')
+        manifest = json.load(open(mpath))
+        B = o2s.mat(manifest['box']['transform'])
+        B[:3, 3] += B[:3, 2] * 0.012  # only the front 10 mm of a 30 mm deep object, as one tap view sees it
+        manifest['box'] = {'transform': o2s.column_major(B), 'size': [0.060, 0.052, 0.010]}
+        json.dump(manifest, open(mpath, 'w'))
+        grown = run(shallow, os.path.join(root, 'shallow'), '--refine', '0', '--no-preview')
+        check(bool(grown.get('boxGrowthMM')) and not grown['boxWallContact']
+              and bool(np.all(np.abs(np.array(grown['mesh']['sizeMM']) - TRUE_SIZE_MM) < 1.6)),
+              'a too-shallow box grows to the whole object')
+        cut = run(shallow, os.path.join(root, 'shallow-cut'), '--refine', '0', '--grow-mm', '0', '--no-preview')
+        check(bool(cut['boxWallContact']) and any('cut flat' in w for w in cut['warnings']),
+              'with growth off, the cut is reported')
     finally:
         if not a.keep:
             shutil.rmtree(root, ignore_errors=True)

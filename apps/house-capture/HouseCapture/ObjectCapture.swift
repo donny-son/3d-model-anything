@@ -54,8 +54,8 @@ struct ObjectBox: Codable {
 struct SupportPlane: Codable {
   var point: [Float]
   var normal: [Float]
-  /// "mat" (printed capture mat), "plane-anchor" (ARKit plane), "depth" (table found in the
-  /// LiDAR depth) or "raycast" (nothing found: a level plane through the tapped point)
+  /// "mat" (printed capture mat), "plane-anchor" (ARKit plane under the tap) or "depth" (table
+  /// height found in the LiDAR depth around the tap)
   var source: String
   var classification: String?
 }
@@ -107,13 +107,19 @@ struct ObjectScan: Identifiable {
     FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("Objects", isDirectory: true)
   }
 
+  /// Saved scans, and folders left without a manifest (a failed save) so they can be removed
   static func all() -> [ObjectScan] {
-    let folders = (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
+    try? FileManager.default.removeItem(at: trash) // scans discarded earlier
+    let folders = (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey],
+                                                                options: [.skipsHiddenFiles])) ?? []
     return folders
-      .filter { FileManager.default.fileExists(atPath: $0.appendingPathComponent("manifest.json").path) }
+      .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
       .map { ObjectScan(url: $0, manifest: loadManifest($0)) }
       .sorted { $0.id > $1.id }
   }
+
+  /// Discarded scans wait here (hidden from the library) until their last writes have finished
+  static var trash: URL { root.appendingPathComponent(".trash", isDirectory: true) }
 
   static func create(name: String) throws -> ObjectScan {
     var id = HouseProject.folderName(for: Date())
@@ -294,6 +300,7 @@ final class ObjectCaptureController: NSObject, ObservableObject {
   private var events: [Diagnostics.Event] = []
   private var began = false
   private var closed = false
+  private var lastStorageCheck: TimeInterval = 0
 
   // box
   private var plane: PlaneEstimate?
@@ -322,6 +329,7 @@ final class ObjectCaptureController: NSObject, ObservableObject {
   /// rad/s: faster than this the LiDAR depth smears (the STL pipeline uses the same limit)
   static let maxRotationRate = 1.2
   static let photoRotationRate = 0.35
+  private static let photoWarning = "A photo could not be saved. Check available storage."
 
   static var isSupported: Bool { ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) }
 
@@ -330,6 +338,7 @@ final class ObjectCaptureController: NSObject, ObservableObject {
     self.name = name
     super.init()
     view.session = arSession
+    view.delegate = self
     view.scene = SCNScene()
     view.automaticallyUpdatesLighting = false
     view.rendersCameraGrain = false
@@ -348,22 +357,43 @@ final class ObjectCaptureController: NSObject, ObservableObject {
   func begin() {
     guard !began else { return }
     began = true
+    UIApplication.shared.isIdleTimerDisabled = true // you walk around the object without touching the screen
+    let config = Self.configuration(mat: nil)
+    arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
+    motion.start()
+    logEvent("started: depth=\(config.frameSemantics.contains(.sceneDepth)) imu=\(motion.isAvailable)")
+    // ARKit fails the whole session on a reference image it rejects: validate the mat first, then
+    // add it to the running session (same world, no reset)
+    if let mat = Self.matReferenceImage() {
+      mat.validate { [weak self] error in
+        let problem = error?.localizedDescription
+        Task { @MainActor in
+          guard let self, !self.closed else { return }
+          if let problem {
+            self.logEvent("capture mat not usable: \(problem)")
+          } else {
+            self.arSession.run(Self.configuration(mat: mat), options: [])
+            self.logEvent("capture mat tracking on")
+          }
+        }
+      }
+    }
+    let link = CADisplayLink(target: self, selector: #selector(tick))
+    link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+    link.add(to: .main, forMode: .common)
+    displayLink = link
+  }
+
+  private static func configuration(mat: ARReferenceImage?) -> ARWorldTrackingConfiguration {
     let config = ARWorldTrackingConfiguration()
     config.planeDetection = [.horizontal]
     if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) { config.frameSemantics.insert(.sceneDepth) }
-    let mat = Self.matReferenceImage()
     if let mat {
       config.detectionImages = [mat]
       config.maximumNumberOfTrackedImages = 1
       config.automaticImageScaleEstimationEnabled = true
     }
-    arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
-    motion.start()
-    logEvent("started: depth=\(config.frameSemantics.contains(.sceneDepth)) mat=\(mat != nil) imu=\(motion.isAvailable)")
-    let link = CADisplayLink(target: self, selector: #selector(tick))
-    link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
-    link.add(to: .main, forMode: .common)
-    displayLink = link
+    return config
   }
 
   static func matReferenceImage() -> ARReferenceImage? {
@@ -387,16 +417,21 @@ final class ObjectCaptureController: NSObject, ObservableObject {
       warning = "Couldn't measure that spot. Tap the middle of the object."
       return
     }
-    warning = nil
     let p = simd_make_float3(hit.worldTransform.columns.3)
-    let support = supportPlane(below: p, frame: frame)
+    guard let support = supportPlane(below: p, frame: frame) else {
+      warning = "Couldn't find the table under the object. Point at the table around it for a moment, then tap the object again."
+      return
+    }
+    warning = nil
     let n = support.normal
     // box axes: the mat's own, else facing the camera
     var x: SIMD3<Float>
     if support.source == "mat", let m = matTransform {
       x = simd_make_float3(m.columns.0)
     } else {
-      let back = simd_make_float3(frame.camera.transform.columns.2) // camera +Z points back at you
+      // camera +Z points back at you; looking straight down, use the camera's up instead
+      var back = simd_make_float3(frame.camera.transform.columns.2)
+      if simd_length(back - simd_dot(back, n) * n) < 0.05 { back = simd_make_float3(frame.camera.transform.columns.1) }
       let z = simd_normalize(back - simd_dot(back, n) * n)
       x = simd_cross(n, z)
     }
@@ -420,10 +455,10 @@ final class ObjectCaptureController: NSObject, ObservableObject {
     overlay.update(box: boxFrame, size: boxSize, cells: cellFrames)
   }
 
-  /// The surface under the tap: the tracked capture mat; else an ARKit horizontal plane up to
-  /// 40 cm below the tap (clearly below it first, so an object's own flat top isn't taken for the
-  /// table); else the table found in the depth; else a level plane through the tap.
-  private func supportPlane(below p: SIMD3<Float>, frame: ARFrame) -> PlaneEstimate {
+  /// The surface under the tap: the tracked capture mat; else an ARKit horizontal plane that lies
+  /// under the tap and up to 40 cm below it (clearly below it first, so an object's own flat top
+  /// isn't taken for the table); else the table height found in the depth; else nil.
+  private func supportPlane(below p: SIMD3<Float>, frame: ARFrame) -> PlaneEstimate? {
     if let m = matTransform {
       let point = simd_make_float3(m.columns.3), normal = simd_normalize(simd_make_float3(m.columns.1))
       let local = m.inverse * SIMD4(p, 1)
@@ -431,7 +466,14 @@ final class ObjectCaptureController: NSObject, ObservableObject {
         return PlaneEstimate(point: point, normal: normal, source: "mat", classification: nil)
       }
     }
-    let planes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }.filter { $0.alignment == .horizontal }.map { anchor in
+    let planes = frame.anchors.compactMap { $0 as? ARPlaneAnchor }.filter { anchor in
+      guard anchor.alignment == .horizontal else { return false }
+      // the plane's extent (plus 3 cm) must reach the tap: the table, not a book or a chair elsewhere
+      let local = anchor.transform.inverse * SIMD4(p, 1)
+      let dx = local.x - anchor.center.x, dz = local.z - anchor.center.z
+      let extent = anchor.planeExtent
+      return (dx * dx + dz * dz).squareRoot() < (extent.width * extent.width + extent.height * extent.height).squareRoot() / 2 + 0.03
+    }.map { anchor in
       PlaneEstimate(point: simd_make_float3(anchor.transform * SIMD4(anchor.center, 1)),
                     normal: simd_normalize(simd_make_float3(anchor.transform.columns.1)),
                     source: "plane-anchor", classification: String(describing: anchor.classification))
@@ -446,7 +488,7 @@ final class ObjectCaptureController: NSObject, ObservableObject {
     if let y = Self.depthTableHeight(frame: frame, around: p) {
       return PlaneEstimate(point: SIMD3(p.x, y, p.z), normal: SIMD3(0, 1, 0), source: "depth", classification: nil)
     }
-    return PlaneEstimate(point: p, normal: SIMD3(0, 1, 0), source: "raycast", classification: nil)
+    return nil
   }
 
   /// Calls `body` with the world position of every `step`-th LiDAR pixel 8 cm–1.5 m away
@@ -494,8 +536,9 @@ final class ObjectCaptureController: NSObject, ObservableObject {
   }
 
   /// Footprint of whatever stands on the plane around `center`: LiDAR points 4 mm–40 cm above it,
-  /// binned in 5 mm cells and grown from the tapped cell. Returns the footprint centre (x, z offset
-  /// from `center`) and a box size with 1 cm of margin.
+  /// binned in 5 mm cells and grown from the tapped cell, then extended away from the camera to
+  /// cover the side it can't see. Returns the footprint centre (x, z offset from `center`) and a
+  /// box size with 1 cm of margin. The STL pipeline grows the box further from the whole scan.
   private static func footprint(frame: ARFrame, around center: SIMD3<Float>, plane: PlaneEstimate,
                                 x: SIMD3<Float>, z: SIMD3<Float>) -> (center: SIMD2<Float>, size: SIMD3<Float>) {
     let fallback = (center: SIMD2<Float>(0, 0), size: SIMD3<Float>(0.12, 0.12, 0.12))
@@ -503,7 +546,7 @@ final class ObjectCaptureController: NSObject, ObservableObject {
     struct Cell: Hashable { var a: Int; var b: Int }
     var counts: [Cell: Int] = [:]
     var tops: [Cell: Float] = [:]
-    forEachDepthPoint(frame, step: 2, minConfidence: 2) { point in
+    forEachDepthPoint(frame, step: 1, minConfidence: 2) { point in
       let height = simd_dot(point - plane.point, plane.normal)
       guard height > 0.004, height < 0.4 else { return }
       let offset = point - center
@@ -527,8 +570,17 @@ final class ObjectCaptureController: NSObject, ObservableObject {
         }
       }
     }
-    let minA = Float(seen.map(\.a).min()!) * cell, maxA = Float(seen.map(\.a).max()! + 1) * cell
-    let minB = Float(seen.map(\.b).min()!) * cell, maxB = Float(seen.map(\.b).max()! + 1) * cell
+    var minA = Float(seen.map(\.a).min()!) * cell, maxA = Float(seen.map(\.a).max()! + 1) * cell
+    var minB = Float(seen.map(\.b).min()!) * cell, maxB = Float(seen.map(\.b).max()! + 1) * cell
+    // the tap view can't see the far side: make the box at least as deep as it is wide, away from the camera
+    let camera = simd_make_float3(frame.camera.transform.columns.3) - center
+    let toCameraA = simd_dot(camera, x), toCameraB = simd_dot(camera, z)
+    let width = max(maxA - minA, maxB - minB)
+    if abs(toCameraB) >= abs(toCameraA) {
+      if toCameraB > 0 { minB = min(minB, maxB - width) } else { maxB = max(maxB, minB + width) }
+    } else {
+      if toCameraA > 0 { minA = min(minA, maxA - width) } else { maxA = max(maxA, minA + width) }
+    }
     let top = seen.compactMap { tops[$0] }.max() ?? 0.1
     let margin: Float = 0.01
     func clamp(_ v: Float) -> Float { min(0.5, max(0.03, v)) }
@@ -544,6 +596,7 @@ final class ObjectCaptureController: NSObject, ObservableObject {
       warning = error.localizedDescription
       return
     }
+    warning = nil
     motion.record(to: scan.file("motion/imu.f64"))
     phase = .scanning
     logEvent("scanning")
@@ -558,6 +611,11 @@ final class ObjectCaptureController: NSObject, ObservableObject {
 
   func resume() {
     guard phase == .scanning, paused else { return }
+    do { try CaptureReadiness.requireStorage(at: scan.url, bytes: CaptureReadiness.pauseReserve) } catch {
+      warning = error.localizedDescription
+      return
+    }
+    warning = nil
     paused = false
     previousPose = nil
     motion.resumeRecording(to: scan.file("motion/imu.f64"))
@@ -570,14 +628,20 @@ final class ObjectCaptureController: NSObject, ObservableObject {
     let now = frame.timestamp
     trackAnchors(frame)
     let poseRate = Self.poseRate(frame, previous: previousPose)
+    if phase == .scanning, let previous = previousPose, frame.timestamp - previous.time < 0.2,
+       simd_distance(previous.pose.columns.3, frame.camera.transform.columns.3) > 0.5 {
+      logEvent("world jump of \(simd_distance(previous.pose.columns.3, frame.camera.transform.columns.3)) m")
+      warning = "Tracking jumped. If the box no longer sits on the object, finish and scan again."
+    }
     previousPose = (frame.timestamp, frame.camera.transform)
     let rate = motion.isAvailable ? motion.rotationRate : poseRate
     var normal = false
     if case .normal = frame.camera.trackingState { normal = true }
     if whiteBalanceAt == nil, normal { whiteBalanceAt = now + 3 }
-    if let t = whiteBalanceAt, now > t, !cameraControl.whiteBalanceLocked {
+    if let t = whiteBalanceAt, now > t { // once: the photos keep a consistent colour
+      whiteBalanceAt = .infinity
       cameraControl.lockWhiteBalance()
-      logEvent("white balance \(cameraControl.summary ?? "")")
+      logEvent("white balance \(cameraControl.summary ?? "not locked")")
     }
     switch phase {
     case .placing:
@@ -623,6 +687,13 @@ final class ObjectCaptureController: NSObject, ObservableObject {
       lastPublish = frame.timestamp
       distance = dist
       depthFrameCount = depthRecorder.records.count
+    }
+    if frame.timestamp - lastStorageCheck > 5 {
+      lastStorageCheck = frame.timestamp
+      if !paused, let available = CaptureReadiness.available(at: scan.url), available < CaptureReadiness.pauseReserve {
+        pause()
+        warning = "Storage is almost full, so recording is paused. Finish to save what you have, or free space and resume."
+      }
     }
     guard !paused else { return setHint("Paused. Resume when you're back where you stopped.") }
     guard normal else { return setHint(CaptureController.trackingText(frame.camera.trackingState)) }
@@ -716,8 +787,9 @@ final class ObjectCaptureController: NSObject, ObservableObject {
         if ok {
           self.photos.append(record)
           self.photoCount = self.photos.count
+          if self.warning == Self.photoWarning { self.warning = nil }
         } else {
-          self.warning = "A photo could not be saved. Check available storage."
+          self.warning = Self.photoWarning
         }
       }
     }
@@ -735,6 +807,8 @@ final class ObjectCaptureController: NSObject, ObservableObject {
       try? await Task.sleep(for: .milliseconds(50))
     }
     arSession.pause()
+    restoreDevice()
+    defer { closed = true } // writes that finish later are not in the saved index: ignore them
     do {
       try depthRecorder.save()
       try scan.write(photos, to: "photos/photos.json")
@@ -775,21 +849,58 @@ final class ObjectCaptureController: NSObject, ObservableObject {
     return m
   }
 
-  /// Leave without saving: the scan folder is deleted
+  /// Whether anything was recorded worth keeping after a failure
+  var hasRecording: Bool { !depthRecorder.records.isEmpty || !photos.isEmpty }
+
+  /// Leave without saving. The folder leaves the library at once and is deleted when the writes
+  /// still in flight have finished (they fail harmlessly once it has moved).
   func abandon() {
     closed = true
     stopTicking()
     motion.stop()
     arSession.pause()
-    try? scan.delete()
+    restoreDevice()
+    let fm = FileManager.default
+    let parked = ObjectScan.trash.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try? fm.createDirectory(at: ObjectScan.trash, withIntermediateDirectories: true)
+    let doomed = (try? fm.moveItem(at: scan.url, to: parked)) != nil ? parked : scan.url
+    let recorder = depthRecorder
+    Task { @MainActor in
+      let deadline = Date().addingTimeInterval(5)
+      while (recorder.isWriting || self.photosInFlight > 0) && Date() < deadline {
+        try? await Task.sleep(for: .milliseconds(50))
+      }
+      try? fm.removeItem(at: doomed)
+    }
   }
 
-  /// Leave after saving (or after a failed save, keeping what was written)
+  /// Leave after saving (or after a failure, keeping what was written)
   func close() {
     closed = true
     stopTicking()
     motion.stop()
     arSession.pause()
+    restoreDevice()
+  }
+
+  private func restoreDevice() {
+    UIApplication.shared.isIdleTimerDisabled = false
+    cameraControl.unlock()
+  }
+
+  fileprivate func sessionFailed(_ message: String) {
+    logEvent("ARKit failed: \(message)")
+    guard !closed else { return }
+    switch phase {
+    case .scanning where depthRecorder.records.count >= 10:
+      pause()
+      warning = "The camera stopped tracking (\(message)). Tap Finish to save what was recorded."
+    case .saving, .done, .failed:
+      break
+    default:
+      stopTicking()
+      phase = .failed("The camera stopped: \(message). Close and start the scan again.")
+    }
   }
 
   private func stopTicking() {
@@ -797,12 +908,34 @@ final class ObjectCaptureController: NSObject, ObservableObject {
     displayLink = nil
   }
 
-  private func logEvent(_ what: String) {
+  fileprivate func logEvent(_ what: String) {
     events.append(Diagnostics.Event(t: (Date().timeIntervalSince(startedAt) * 10).rounded() / 10, what: what))
   }
 }
 
 extension ObjectCaptureController: Identifiable {}
+
+extension ObjectCaptureController: ARSCNViewDelegate {
+  nonisolated func session(_ session: ARSession, didFailWithError error: Error) {
+    let message = error.localizedDescription
+    Task { @MainActor in self.sessionFailed(message) }
+  }
+
+  /// After an interruption (lock, call, app switch) ARKit finds its way back into the same world,
+  /// so the box and the frames recorded so far still line up
+  nonisolated func sessionShouldAttemptRelocalization(_ session: ARSession) -> Bool { true }
+
+  nonisolated func sessionWasInterrupted(_ session: ARSession) {
+    Task { @MainActor in
+      self.logEvent("ARKit session interrupted")
+      self.pause()
+    }
+  }
+
+  nonisolated func sessionInterruptionEnded(_ session: ARSession) {
+    Task { @MainActor in self.logEvent("ARKit session interruption ended") }
+  }
+}
 
 // MARK: - AR overlay
 

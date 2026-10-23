@@ -108,7 +108,7 @@ struct ObjectCaptureScreen: View {
     case .adjusting:
       panel {
         Text("Object box").font(.headline)
-        Text(String(format: "%.0f × %.0f × %.0f mm", controller.boxSize.x * 1000, controller.boxSize.z * 1000, controller.boxSize.y * 1000))
+        Text(String(format: "W %.0f · D %.0f · H %.0f mm", controller.boxSize.x * 1000, controller.boxSize.z * 1000, controller.boxSize.y * 1000))
           .font(.subheadline.monospacedDigit())
         Text(controller.hint).font(.caption)
         LabeledContent("Footprint") {
@@ -147,7 +147,7 @@ struct ObjectCaptureScreen: View {
         Label("Saved \(controller.name)", systemImage: "checkmark.circle.fill").font(.headline)
         Text("\(controller.depthFrameCount) depth frames, \(controller.photoCount) photos, \(Int((controller.coverage * 100).rounded()))% of view directions.")
           .font(.subheadline)
-        Text("Share the scan to your computer, unzip it, and run:\nobject_to_stl.py <scan folder>\n(scan-to-stl skill in this repository) to get the STL.")
+        Text(verbatim: "Share the scan to your computer, unzip it, and run:\nobject_to_stl.py <scan folder>\n(scan-to-stl skill in this repository) to get the STL.")
           .font(.caption.monospaced())
         Button {
           share()
@@ -163,9 +163,11 @@ struct ObjectCaptureScreen: View {
     case .failed(let message):
       panel {
         Text(message).font(.subheadline)
-        Text("Files already written are kept in the Objects folder.").font(.caption)
+        if controller.hasRecording {
+          Text("What was recorded is kept in the Objects list, where you can share or delete it.").font(.caption)
+        }
         Button("Close") {
-          controller.close()
+          if controller.hasRecording { controller.close() } else { controller.abandon() }
           onClose()
         }
         .buttonStyle(.bordered)
@@ -296,7 +298,9 @@ struct ObjectLibraryScreen: View {
       Text(scan.name).font(.title3.bold())
       Text(summary(scan)).font(.footnote).foregroundStyle(Fieldwork.secondary)
       HStack {
-        Button { share(scan) } label: { Label("Share (.zip)", systemImage: "square.and.arrow.up") }
+        if scan.manifest != nil {
+          Button { share(scan) } label: { Label("Share (.zip)", systemImage: "square.and.arrow.up") }
+        }
         Spacer()
         Button(role: .destructive) { deleting = scan } label: { Label("Delete", systemImage: "trash") }
       }
@@ -306,10 +310,10 @@ struct ObjectLibraryScreen: View {
   }
 
   private func summary(_ scan: ObjectScan) -> String {
-    guard let m = scan.manifest else { return scan.id }
+    guard let m = scan.manifest else { return "Incomplete: not saved (\(scan.id)). It can't be converted; delete it to free space." }
     var parts = [m.createdAt.formatted(date: .abbreviated, time: .shortened), "\(m.depthFrameCount) depth frames", "\(m.photoCount) photos"]
     if let size = m.box?.size, size.count == 3 {
-      parts.append(String(format: "box %.0f×%.0f×%.0f mm", size[0] * 1000, size[2] * 1000, size[1] * 1000))
+      parts.append(String(format: "box W %.0f · D %.0f · H %.0f mm", size[0] * 1000, size[2] * 1000, size[1] * 1000))
     }
     if let coverage = m.viewCoverage { parts.append("\(Int((coverage * 100).rounded()))% of views") }
     if m.mat != nil { parts.append("on mat") }
@@ -328,7 +332,9 @@ struct ObjectLibraryScreen: View {
       defer { busy = nil }
       do {
         try await CaptureReadiness.prepare()
-        capture = try ObjectCaptureController.start(name: name.isEmpty ? "Object" : name)
+        let controller = try ObjectCaptureController.start(name: name.isEmpty ? "Object" : name)
+        try? await Task.sleep(for: .milliseconds(400)) // let the name alert finish dismissing
+        capture = controller
       } catch { self.error = error.localizedDescription }
     }
   }
