@@ -106,8 +106,8 @@ tunnels in poorly seen surfaces (cup floors and insides) whatever the wall thick
 holes in walls of about 2–3 mm, so keep it only if `mesh.genus` stays close to the default run's.
 
 `mesh.caliperMM` is the size `--calibrate axis=mm` works with: on each side, the area-weighted median
-position of the outer layer of surface facing that way (bumps under about 2 mm² and the base flare
-don't count). The fused mesh sits slightly inside the true surface and this outer-layer reading
+position of the outer layer of surface facing that way (a band holding under 2 mm² is taken for a
+bump and skipped, and the base flare doesn't count). The fused mesh sits slightly inside the true surface and this outer-layer reading
 offsets that, so it averages within a few hundredths of a millimetre of the truth with about ±0.3 mm
 of scatter per reading. `sizeMM` is the plain bounding box, which reads about 0.5–1.5 mm larger. On the synthetic block
 and can, `caliperMM` comes within about 0.35 mm of the true sizes (49.90 × 30.12 × 44.94 mm for
@@ -115,6 +115,7 @@ and can, `caliperMM` comes within about 0.35 mm of the true sizes (49.90 × 30.1
 leaves the mean surface error the same or lower. Compare a caliper value with the same axis of `caliperMM` (X is the footprint's long side, Y its
 short side, Z the height), not with `sizeMM`. Because each reading scatters by about ±0.3 mm, calibrate
 only when they differ by more than about 0.5 mm; the report warns when a calibration is within that
-noise, or when the value matches a different axis better. Calibrate on the longest dimension, between
+0.5 mm, and when it would rescale by more than 3 % while the value matches a different axis much
+better (ARKit's scale is rarely that far off, so that is usually a mix-up of axes). Calibrate on the longest dimension, between
 flat faces or across a round body away from the base; a short side magnifies any error. For critical
 fits, print a test piece.

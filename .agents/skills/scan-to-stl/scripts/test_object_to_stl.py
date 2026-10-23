@@ -304,6 +304,9 @@ def main():
         # calibrating with the true size must not make the model worse (the bounding box is noise-inflated)
         check(abs(am['volumeMM3'] / TRUE_VOLUME_MM3 - 1) < 0.04 and auto_mean < 0.3,
               '--calibrate x=50 (the true size) keeps volume within 4% and the surface within 0.3 mm')
+        mixed = run(scan, os.path.join(root, 'wrong-axis'), '--calibrate', 'x=45', '--no-preview')
+        check(any('did you measure z' in w for w in mixed['warnings']),
+              'calibrating X with the height (45 mm, a 10% rescale) is flagged as the wrong axis')
         check(bool(np.all(np.abs(np.array(am['sizeMM']) - TRUE_SIZE_MM) < 1.6)), 'automatic box size within 1.6 mm')
 
         print('\n== box too shallow on the phone ==')

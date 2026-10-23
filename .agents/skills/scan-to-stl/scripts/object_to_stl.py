@@ -868,8 +868,8 @@ def mesh_report(V, F):
 def robust_extent(P, F, k, base_mm=2.0, cone_deg=10.0, band_mm=0.5, q=0.002):
     """Extent along axis k (mm) as calipers would read the real object: on each side, the
     area-weighted median position of the outermost surface facing that way (within `cone_deg`, within
-    `band_mm` of the extreme), so a face counts at a typical point of its outer layer and a bump
-    smaller than about 2 mm² is ignored. The fused mesh sits slightly inside the true surface, which
+    `band_mm` of the extreme), so a face counts at a typical point of its outer layer; a band holding
+    under 2 mm² is a bump, which is dropped before looking again. The fused mesh sits slightly inside the true surface, which
     this outer-layer reading offsets: on the synthetic block and can it comes within about 0.4 mm of
     the true sizes (mean +0.03 mm). Where nothing faces that way (a tip or an edge), the outermost `q`
     of the area is ignored instead. For X/Y the extended base flare is left out."""
@@ -885,13 +885,19 @@ def robust_extent(P, F, k, base_mm=2.0, cone_deg=10.0, band_mm=0.5, q=0.002):
     for sign in (1.0, -1.0):
         x = sign * c[:, k]
         facing = keep & (sign * n[:, k] > math.cos(math.radians(cone_deg)))
-        if facing.any():
-            facing &= x > x[facing].max() - band_mm
-        sel = facing if area[facing].sum() > 2.0 else keep
-        xs, ws = x[sel], area[sel]
+        sel = None
+        for _ in range(50):
+            if not facing.any():
+                break
+            band = facing & (x > x[facing].max() - band_mm)
+            if area[band].sum() > 2.0:
+                sel = band
+                break
+            facing &= ~band  # a small bump: ignore it and look again
+        xs, ws = (x[sel], area[sel]) if sel is not None else (x[keep], area[keep])
         o = np.argsort(xs)
         cw = np.cumsum(ws[o]) / ws.sum()
-        ends.append(sign * xs[o][np.searchsorted(cw, 0.5 if sel is facing else 1 - q)])
+        ends.append(sign * xs[o][np.searchsorted(cw, 0.5 if sel is not None else 1 - q)])
     return float(ends[0] - ends[1])
 
 
@@ -1186,11 +1192,12 @@ def main(argv=None):
         target = float(value)
         scale *= target / measured
         scale_source = f'calibrated {axis}={value} mm (measured {measured:.2f}, bounding box {raw:.2f})'
-        if abs(target - measured) < 0.4:
+        if abs(target - measured) < 0.5:
             warnings.append(f'--calibrate {axis}={value}: the scan already reads {measured:.2f} mm there, within its '
-                            '~0.4 mm measurement noise, so this rescale (x{:.4f}) may not make it more accurate'.format(target / measured))
-        others = [j for j in range(3) if j != k and abs(readings[j] / target - 1) < 0.03]
-        if abs(target / measured - 1) > 0.1 and others:
+                            '~0.5 mm measurement noise, so this rescale (x{:.4f}) may not make it more accurate'.format(target / measured))
+        off = abs(measured / target - 1)  # ARKit scale is rarely more than ~2% off: a bigger gap that another
+        others = [j for j in range(3) if j != k and abs(readings[j] / target - 1) < min(0.03, off / 3)]
+        if off > 0.03 and others:  # axis fits much better suggests the wrong axis
             j = others[0]
             warnings.append(f'--calibrate {axis}={value} rescaled the model by x{target / measured:.3f}, but the scan reads '
                             f'{readings[j]:.2f} mm along {"xyz"[j]}: did you measure {"xyz"[j]}? (X and Y are the '

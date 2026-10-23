@@ -826,6 +826,7 @@ final class ObjectCaptureController: NSObject, ObservableObject {
       // keep whatever index still writes, so a scan with enough frames stays convertible; the rest
       // is only worth writing once the (atomically written) depth index is on disk
       let indexed = hasDepthIndex || (try? depthRecorder.save()) != nil
+      indexSaveFailed = !indexed
       if depthRecorder.records.count >= 10, indexed {
         try? scan.write(photos, to: "photos/photos.json")
         try? scan.write(features, to: "features/points.json")
@@ -867,7 +868,8 @@ final class ObjectCaptureController: NSObject, ObservableObject {
   var hasRecording: Bool { !depthRecorder.records.isEmpty || !photos.isEmpty }
   /// Whether the depth index reached the disk (it is written atomically), so the scan can be shared and converted
   var hasDepthIndex: Bool { FileManager.default.fileExists(atPath: scan.file("depth/frames.json").path) }
-  var recordedFrames: Int { depthRecorder.records.count }
+  /// Finish tried to write the depth index and couldn't (storage full?)
+  private(set) var indexSaveFailed = false
 
   /// Leave without saving. The folder leaves the library at once and is deleted when the writes
   /// still in flight have finished (they fail harmlessly once it has moved).
