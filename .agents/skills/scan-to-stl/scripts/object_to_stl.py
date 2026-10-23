@@ -866,11 +866,13 @@ def mesh_report(V, F):
 # --- output -----------------------------------------------------------------------------
 
 def robust_extent(P, F, k, base_mm=2.0, cone_deg=10.0, band_mm=0.5, q=0.002):
-    """Extent along axis k (mm) as calipers would measure it, robust to LiDAR noise bumps: on each
-    side, the area-weighted median position of the outermost surface facing that way (within
-    `cone_deg`, within `band_mm` of the extreme), so a flat face counts at its mean position. Where
-    nothing faces that way (a tip or an edge), the outermost `q` of the area is ignored instead.
-    For X/Y the extended base flare is left out."""
+    """Extent along axis k (mm) as calipers would read the real object: on each side, the
+    area-weighted median position of the outermost surface facing that way (within `cone_deg`, within
+    `band_mm` of the extreme), so a face counts at a typical point of its outer layer and a bump
+    smaller than about 2 mm² is ignored. The fused mesh sits slightly inside the true surface, which
+    this outer-layer reading offsets: on the synthetic block and can it comes within about 0.4 mm of
+    the true sizes (mean +0.03 mm). Where nothing faces that way (a tip or an edge), the outermost `q`
+    of the area is ignored instead. For X/Y the extended base flare is left out."""
     tri = P[F]
     c = tri.mean(1)
     n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
@@ -1179,9 +1181,20 @@ def main(argv=None):
         axis, value = a.calibrate.split('=')
         k = 'xyz'.index(axis.strip().lower())
         raw = (P[:, k].max() - P[:, k].min()) * scale
-        measured = robust_extent(P, F, k) * scale
-        scale *= float(value) / measured
+        readings = [robust_extent(P, F, j) * scale for j in range(3)]
+        measured = readings[k]
+        target = float(value)
+        scale *= target / measured
         scale_source = f'calibrated {axis}={value} mm (measured {measured:.2f}, bounding box {raw:.2f})'
+        if abs(target - measured) < 0.4:
+            warnings.append(f'--calibrate {axis}={value}: the scan already reads {measured:.2f} mm there, within its '
+                            '~0.4 mm measurement noise, so this rescale (x{:.4f}) may not make it more accurate'.format(target / measured))
+        others = [j for j in range(3) if j != k and abs(readings[j] / target - 1) < 0.03]
+        if abs(target / measured - 1) > 0.1 and others:
+            j = others[0]
+            warnings.append(f'--calibrate {axis}={value} rescaled the model by x{target / measured:.3f}, but the scan reads '
+                            f'{readings[j]:.2f} mm along {"xyz"[j]}: did you measure {"xyz"[j]}? (X and Y are the '
+                            "footprint's long and short sides, Z the height)")
     P *= scale
     P[:, :2] -= (P[:, :2].min(0) + P[:, :2].max(0)) / 2
     P[:, 2] -= P[:, 2].min()
@@ -1215,8 +1228,8 @@ def main(argv=None):
         warnings.append(f'{info["unobservedSurfaceFraction"]:.0%} of the surface (not counting the base) was never measured '
                         'and was filled in as solid: rescan the missing sides, or treat those parts as guessed')
     if info.get('boxWallContact'):
-        fix = ('a larger --box-size-mm' if a.box_size_mm else
-               'a larger --margin-mm (e.g. 30) or --grow-mm' if info.get('box') != 'auto' else 'a larger --radius-mm')
+        fix = ('a larger --radius-mm (or --margin-mm)' if info.get('box') == 'auto' else
+               'a larger --box-size-mm' if a.box_size_mm else 'a larger --margin-mm (e.g. 30) or --grow-mm')
         warnings.append(f'the object reaches the edge of the fusion volume ({", ".join(info["boxWallContact"])}) and was '
                         f'cut flat there: rerun with {fix}')
     if info.get('boxGrowthMM'):
@@ -1227,7 +1240,8 @@ def main(argv=None):
         warnings.append(f'{info["thinSolidFraction"]:.0%} of the solid is thinner than ~{thin_mm:.0f} mm: fusion thickens such '
                         'walls by up to ~1.5 mm on their less-seen (inner) side, so inner sizes come out small, and walls '
                         'under ~2-3 mm can get holes (check mesh.genus); measure a wall'
-                        + ('' if a.trunc_mm <= 2.5 else '. --trunc-mm 2.5 thins them but opens holes in walls of ~3 mm or less'))
+                        + ('' if a.trunc_mm <= 2.5 else '. --trunc-mm 2.5 thins them but adds tunnels in poorly seen '
+                                                         'surfaces and opens holes in walls of ~2-3 mm: compare mesh.genus'))
     if min(report['sizeMM']) < 15:
         warnings.append('features under ~3 mm are below what iPhone LiDAR resolves; expect rounded edges')
     pr = info.get('poseRefinement')

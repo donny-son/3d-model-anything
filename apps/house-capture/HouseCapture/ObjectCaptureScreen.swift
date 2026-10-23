@@ -169,6 +169,8 @@ struct ObjectCaptureScreen: View {
         if controller.hasRecording {
           Text(controller.hasDepthIndex
                ? "What was recorded is kept in the Objects list, where you can share or delete it."
+               : controller.recordedFrames >= 10
+               ? "Its depth index couldn't be saved (is storage full?), so it can't be converted. Delete it from the Objects list to free space."
                : "What was recorded is kept in the Objects list until you delete it; it is too short to convert.")
             .font(.caption)
         }

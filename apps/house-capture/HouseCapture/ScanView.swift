@@ -389,7 +389,8 @@ final class DepthRecorder: @unchecked Sendable {
   func save() throws {
     let e = JSONEncoder()
     e.outputFormatting = [.prettyPrinted]
-    try e.encode(records).write(to: bundle.file("depth/frames.json"))
+    // atomic: a failed rewrite (storage full) keeps the previous index instead of a truncated one
+    try e.encode(records).write(to: bundle.file("depth/frames.json"), options: .atomic)
   }
 
   func discard(room: Int) {

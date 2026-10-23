@@ -101,15 +101,20 @@ vases, boxes) is seen far more from outside than inside, so fusion thickens it b
 the inner side: inner diameters come out small, and walls under about 2–3 mm can get holes (watch
 `mesh.genus`: a solid without real handles should be 0 or a handful; tens or more means tunnels).
 Calibrating on an outer dimension does not fix this; measure the wall or an inner size when it
-matters. `--trunc-mm 2.5` thins such walls by a few tenths of a millimetre but opens holes in walls of
-about 3 mm or less, so keep it only if `mesh.genus` stays close to the default run's.
+matters. `--trunc-mm 2.5` thins such walls by a few tenths of a millimetre, but it adds tens of
+tunnels in poorly seen surfaces (cup floors and insides) whatever the wall thickness and opens real
+holes in walls of about 2–3 mm, so keep it only if `mesh.genus` stays close to the default run's.
 
 `mesh.caliperMM` is the size `--calibrate axis=mm` works with: on each side, the area-weighted median
-position of the outermost surface facing that way, so single noise bumps and the base flare don't
-count. `sizeMM` is the plain bounding box, which reads about 0.5–1.5 mm larger. On the synthetic block
+position of the outer layer of surface facing that way (bumps under about 2 mm² and the base flare
+don't count). The fused mesh sits slightly inside the true surface and this outer-layer reading
+offsets that, so it averages within a few hundredths of a millimetre of the truth with about ±0.3 mm
+of scatter per reading. `sizeMM` is the plain bounding box, which reads about 0.5–1.5 mm larger. On the synthetic block
 and can, `caliperMM` comes within about 0.35 mm of the true sizes (49.90 × 30.12 × 44.94 mm for
 50 × 30 × 45; 59.87 × 59.65 × 39.97 for 60 × 60 × 40), and calibrating on the true length or diameter
-leaves the mean surface error the same or lower. Compare a caliper value with `caliperMM`, not
-`sizeMM`: if they agree within a few tenths of a millimetre, calibrating gains little. Calibrate on the
-longest dimension, between flat faces or across a round body away from the base; a short side
-magnifies any error. For critical fits, print a test piece.
+leaves the mean surface error the same or lower. Compare a caliper value with the same axis of `caliperMM` (X is the footprint's long side, Y its
+short side, Z the height), not with `sizeMM`. Because each reading scatters by about ±0.3 mm, calibrate
+only when they differ by more than about 0.5 mm; the report warns when a calibration is within that
+noise, or when the value matches a different axis better. Calibrate on the longest dimension, between
+flat faces or across a round body away from the base; a short side magnifies any error. For critical
+fits, print a test piece.

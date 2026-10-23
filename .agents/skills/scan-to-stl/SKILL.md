@@ -22,7 +22,7 @@ Set `S` to this skill's `scripts` directory. Needs Python 3 with NumPy (Pillow f
 
 ```sh
 python3 "$S/object_to_stl.py" data/captures-in/mug            # → data/captures-in/mug/print/
-python3 "$S/object_to_stl.py" data/captures-in/mug --calibrate x=82.4   # caliper-measured X (the longest side) in mm
+python3 "$S/object_to_stl.py" data/captures-in/mug --calibrate x=82.4   # caliper-measured X in mm (footprint's long side; y= short side, z= height)
 python3 "$S/test_object_to_stl.py"                              # synthetic end-to-end check
 python3 "$S/make_capture_mat.py" -o capture-mat.pdf --paper letter     # printable mat
 ```
@@ -33,7 +33,7 @@ Outputs in `<scan>/print/` (or `-o`): `<name>.stl` (binary, mm, Z up, base on Z 
 
 1. Read `report.json`: `mesh.watertight`, `mesh.consistentOrientation`, `mesh.components` (1), `sizeMM`, `volumeMM3`, `mesh.genus` (0 or a handful for an object without handles; tens or more means tunnels or holes), `sizeMM` (bounding box) and `mesh.caliperMM` (what calipers would read), `frames` (used/rejected/unreadable), `poseRefinement` (residual before → after, corrections), `planeRefit`, `boxGrowthMM`, `boxWallContact`, `unobservedSurfaceFraction`, `thinSolidFraction`, `viewCoverage`, `warnings`. Relay every warning.
 2. Look at `preview.png`. Compare it with a few of the scan's `photos/*.jpg` (rotate 90° clockwise to view upright). Look for missing thin parts, blobs fused from neighbouring clutter, and a skirt at the base.
-3. Ask for one caliper measurement whenever accuracy matters, ideally the longest dimension (between flat faces, or across a round body away from the base), compare it with `mesh.caliperMM` (not the bounding box `sizeMM`), and if they differ by more than a few tenths of a millimetre rerun with `--calibrate axis=mm` (axes as in the STL: X is the footprint's long side). State the residual uncertainty: LiDAR fusion is typically within ~1 mm on matte objects; shiny, black, transparent or very thin features are worse, and thin walls come out thick (below).
+3. Ask for one caliper measurement whenever accuracy matters, ideally the longest dimension (between flat faces, or across a round body away from the base), and note which STL axis it is: X is the footprint's long side, Y its short side, Z the height. Compare it with that axis of `mesh.caliperMM` (not the bounding box `sizeMM`). Each reading carries about ±0.3 mm of scan noise, so rerun with `--calibrate axis=mm` only when they differ by more than about 0.5 mm; the report warns when a calibration is within the noise or the value matches a different axis. State the residual uncertainty: LiDAR fusion is typically within ~1 mm on matte objects; shiny, black, transparent or very thin features are worse, and thin walls come out thick (below).
 
 ## Fixing common problems
 
@@ -44,7 +44,7 @@ Outputs in `<scan>/print/` (or `-o`): `<name>.stl` (binary, mm, Z up, base on Z 
 - Doubled or blurred surfaces with large `poseRefinement` corrections: tracking drifted. Rescan on the capture mat or a textured surface. Try `--refine 0` to compare against raw ARKit poses.
 - Many frames rejected for motion: the scan was too fast; `--max-rotation-rate` relaxes the limit at the cost of smeared depth.
 - Underside, deep holes or overhangs are filled solid when no frame saw into them. That is deliberate (printable), not measured; `unobservedSurfaceFraction` says how much of the outer surface was filled in. Say so.
-- Thin walls (`thinSolidFraction` warning; cups, bowls, boxes): fusion thickens them by about 0.5–1.5 mm on the less-seen inner side, so inner sizes are small and walls under ~2–3 mm can get holes (check `mesh.genus`). Calibrating on an outer size doesn't fix that. Measure a wall; `--trunc-mm 2.5` thins walls but opens holes in walls of ~3 mm or less, so keep it only if `mesh.genus` stays near the default run's. For a precise fit, model the walls in CAD from the measured outer shape.
+- Thin walls (`thinSolidFraction` warning; cups, bowls, boxes): fusion thickens them by about 0.5–1.5 mm on the less-seen inner side, so inner sizes are small and walls under ~2–3 mm can get holes (check `mesh.genus`). Calibrating on an outer size doesn't fix that. Measure a wall. `--trunc-mm 2.5` thins walls by a few tenths of a millimetre but adds tunnels in poorly seen surfaces (cup floors, insides) and opens holes in walls of ~2–3 mm, so keep it only if `mesh.genus` stays near the default run's. For a precise fit, model the walls in CAD from the measured outer shape.
 - Scale: `--calibrate` with a caliper value on the longest dimension, after comparing it with `mesh.caliperMM`. `--mat-scale` applies ARKit's estimate of the capture mat's size; it is only as good as the print, so measure the mat's 100 mm bar and pass `--mat-width-mm` (the pattern is 180 mm wide at 100 %) if it is off.
 
 For fine detail beyond LiDAR resolution (text, threads, sharp edges), model the part in CAD using the STL and photos as reference rather than over-processing the scan.

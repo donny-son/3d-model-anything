@@ -342,6 +342,9 @@ def main():
             check(abs(sized['mesh']['caliperMM'][0] - 60) < 0.01, 'after --calibrate x=60 the reported caliper size is 60')
             check(sized_err < plain_err + 0.02 and abs(sized['mesh']['volumeMM3'] / volume - 1) < 0.04,
                   'calibrating a round object on its true diameter does not make it worse')
+            wrong = run(can, os.path.join(root, 'can-wrong-axis'), *box, '--refine', '0', '--calibrate', 'x=40')
+            check(any('did you measure z' in w for w in wrong['warnings']),
+                  'calibrating X with the height (40 mm) is flagged as the wrong axis')
     finally:
         if not a.keep:
             shutil.rmtree(root, ignore_errors=True)
