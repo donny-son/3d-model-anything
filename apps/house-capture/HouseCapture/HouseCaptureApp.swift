@@ -51,6 +51,18 @@ struct HomeView: View {
             Text("Room by room. Every detail.").font(.title3).foregroundStyle(Fieldwork.secondary)
           }.padding(.top, 20).padding(.bottom, 36)
           FieldworkRule()
+          NavigationLink { ObjectLibraryScreen() } label: {
+            HStack(spacing: 16) {
+              VStack(alignment: .leading, spacing: 6) {
+                FieldworkEyebrow(text: "Small objects")
+                Text("Scan something to 3D print").font(.title3.bold()).foregroundStyle(Fieldwork.ink)
+                Text("LiDAR depth + camera positions + motion → STL").font(.footnote).foregroundStyle(Fieldwork.secondary)
+              }
+              Spacer()
+              Image(systemName: "cube").font(.title2).foregroundStyle(Fieldwork.orange)
+            }.padding(.vertical, 22).contentShape(Rectangle())
+          }.buttonStyle(.plain)
+          FieldworkRule()
           if houses.isEmpty {
             VStack(alignment: .leading, spacing: 18) {
               Image(systemName: "house.lodge").font(.system(size: 64, weight: .ultraLight)).foregroundStyle(Fieldwork.orange)

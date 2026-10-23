@@ -334,15 +334,21 @@ final class DepthRecorder: @unchecked Sendable {
     self.bundle = bundle
   }
 
-  /// Call every frame; keeps one when the camera has moved or turned enough (≤ 5/s)
-  func consider(_ frame: ARFrame, room: Int, camera: CameraState?, interval: TimeInterval = 0.2) {
-    guard let depth = frame.sceneDepth, inFlight < 3 else { return }
-    guard case .normal = frame.camera.trackingState else { return }
+  /// Writes still pending on the background queue (wait for none before saving the index)
+  var isWriting: Bool { inFlight > 0 }
+
+  /// Call every frame; keeps one when the camera has moved or turned enough (≤ 5/s for rooms;
+  /// object scans pass a shorter interval and smaller steps). Returns whether it kept this frame.
+  @discardableResult
+  func consider(_ frame: ARFrame, room: Int, camera: CameraState?, interval: TimeInterval = 0.2,
+                minMove: Float = 0.04, minTurn: Float = 0.06) -> Bool {
+    guard let depth = frame.sceneDepth, inFlight < 3 else { return false }
+    guard case .normal = frame.camera.trackingState else { return false }
     let pose = frame.camera.transform
     if let last {
       let moved = simd_distance(pose.columns.3, last.pose.columns.3)
       let turned = acos(min(1, max(-1, simd_dot(simd_make_float3(pose.columns.2), simd_make_float3(last.pose.columns.2)))))
-      guard frame.timestamp - last.time > interval, moved > 0.04 || turned > 0.06 else { return }
+      guard frame.timestamp - last.time > interval, moved > minMove || turned > minTurn else { return false }
     }
     last = (frame.timestamp, pose)
     let w = CVPixelBufferGetWidth(depth.depthMap), h = CVPixelBufferGetHeight(depth.depthMap)
@@ -376,6 +382,7 @@ final class DepthRecorder: @unchecked Sendable {
         self.inFlight -= 1
       }
     }
+    return true
   }
 
   func save() throws {

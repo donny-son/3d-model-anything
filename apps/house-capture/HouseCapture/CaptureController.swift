@@ -1548,7 +1548,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
       sharpness: sharpness, depth: depth, room: room)
   }
 
-  nonisolated private static func copy(_ src: CVPixelBuffer) -> CVPixelBuffer? {
+  nonisolated static func copy(_ src: CVPixelBuffer) -> CVPixelBuffer? {
     var out: CVPixelBuffer?
     let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary] as CFDictionary
     CVPixelBufferCreate(nil, CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src), CVPixelBufferGetPixelFormatType(src), attrs, &out)
@@ -1574,7 +1574,7 @@ final class CaptureController: NSObject, ObservableObject, RoomCaptureSessionDel
 
   /// JPEG of the raw sensor image. Pixels stay in sensor orientation (so the saved
   /// intrinsics apply); EXIF orientation 6 makes Photos/Finder show it upright.
-  nonisolated private static func writeJPEG(_ image: CIImage, to url: URL, context: CIContext) -> Bool {
+  nonisolated static func writeJPEG(_ image: CIImage, to url: URL, context: CIContext) -> Bool {
     guard let cg = context.createCGImage(image, from: image.extent, format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB)),
           let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil)
     else { return false }
